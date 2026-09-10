@@ -5,16 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p assets
-swiftc -O -o assets/chromecast-hid-helper native/chromecast-hid-helper.swift
+swiftc -O -o assets/chromecast-hid-helper native/chromecast-hid-helper.swift native/HidBridge.swift native/HIDDiagnostics.swift native/HIDReport.swift
 chmod +x assets/chromecast-hid-helper
 echo "built assets/chromecast-hid-helper"
-assets/chromecast-hid-helper --observe </dev/null &
-pid=$!
-sleep 0.3
-if kill -0 "$pid" 2>/dev/null; then
-  echo "smoke test: helper started (no device events expected)"
-  kill "$pid" 2>/dev/null || true
-else
-  echo "smoke test: helper exited early (check output above)" >&2
-  exit 1
-fi
+# Verify the executable without opening devices or triggering permission UI.
+# stdin EOF is a normal exit, so /dev/null cannot test a long-lived helper.
+assets/chromecast-hid-helper --help

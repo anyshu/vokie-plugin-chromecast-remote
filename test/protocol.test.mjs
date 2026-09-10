@@ -649,7 +649,7 @@ test('adapter-unavailable rejection stops retries permanently', () => {
   assert.equal(sent.filter((message) => message.type === 'ble_scan').length, 1); // no retry
 });
 
-test('connect rejection cleans up and retries with backoff', () => {
+test('connect rejection cleans up and retries with backoff', async () => {
   const clock = new ManualClock();
   const { transport, sent, events } = createTransport(clock);
   transport.start();
@@ -661,8 +661,11 @@ test('connect rejection cleans up and retries with backoff', () => {
   });
   const connect = [...sent].reverse().find((message) => message.type === 'ble_connect');
   transport.handleHostMessage({ type: 'ble_rejected', requestId: connect.requestId, reason: 'busy' });
+  await delay(1);
   // Idempotent disconnect cleanup was issued for the rejected device.
   assert.ok(sent.some((message) => message.type === 'ble_disconnect' && message.deviceId === 'dev-1'));
+  assert.equal(events.status.some((info) => info.phase === 'backoff'), false);
+  await reply(transport, sent, 'ble_disconnect');
   assert.equal(events.status.some((info) => info.phase === 'backoff'), true);
   clock.advance(1000); // first backoff step -> new scan
   assert.equal(sent.filter((message) => message.type === 'ble_scan').length, 2);
@@ -814,7 +817,7 @@ test('hid helper: streams reports, restarts after crashes, gives up bounded', as
     // Every run prints one report then exits 1; respawns are bounded
     // (initial run + 3 restarts), then the source reports unavailable.
     const deadline = Date.now() + 5000;
-    while (Date.now() < deadline && !statuses.some((info) => info.running === false && info.error)) {
+    while (Date.now() < deadline && !statuses.some((info) => info.error?.includes('多次退出'))) {
       await delay(20);
     }
     assert.equal(reports.length, 4);

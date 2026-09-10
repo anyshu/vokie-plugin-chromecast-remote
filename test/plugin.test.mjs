@@ -6,7 +6,7 @@
 // device required.
 
 import assert from 'node:assert/strict';
-import { readFile, writeFile, chmod, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, writeFile, appendFile, chmod, mkdtemp, rm } from 'node:fs/promises';
 import { test } from 'node:test';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -45,6 +45,8 @@ async function startWorker(host, extraEnv = {}) {
       ...process.env,
       VOKIE_PLUGIN_WS_URL: `ws://127.0.0.1:${host.port}`,
       VOKIE_PLUGIN_TOKEN: 'one-time-token',
+      // Tests must not open real HID devices or trigger system permission UI.
+      VOKIE_HID_HELPER: '/nonexistent/test-hid-helper',
       ...extraEnv
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -55,7 +57,7 @@ async function startWorker(host, extraEnv = {}) {
 }
 
 /** Drive the adapter handshake until the remote is connected. */
-async function connectRemote(host) {
+async function connectRemote(host, includeHid = true) {
   const scan = await host.waitFor((m) => m.type === 'ble_scan', 'ble_scan');
   host.sendJson({
     type: 'ble_scan_result',
@@ -64,7 +66,7 @@ async function connectRemote(host) {
   });
   const connect = await host.waitFor((m) => m.type === 'ble_connect', 'ble_connect');
   host.sendJson({ type: 'ble_accepted', requestId: connect.requestId });
-  for (const characteristic of [ATVV.control, ATVV.audio, ATVV.hidReport, ATVV.command]) {
+  for (const characteristic of [ATVV.control, ATVV.audio, ...(includeHid ? [ATVV.hidReport] : []), ATVV.command]) {
     const notify = await host.waitFor(
       (m) => m.type === 'ble_start_notify' && uuidEquals(m.characteristicUuid, characteristic),
       `notify ${characteristic}`
@@ -97,7 +99,7 @@ test('full lifecycle: handshake, hold mode, tap mode, commands, config, stop, sh
     await host.waitFor((m) => m.type === 'initialized', 'initialized');
 
     // Host pushes persisted configuration before start.
-    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: {} });
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: { hidSource: 'gatt' } });
     await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-1', 'configured cfg-1');
 
     host.sendJson({ type: 'start' });
@@ -358,4 +360,89 @@ test('manifest files resolve and worker has no Electron dependency', async () =>
   }
   const workerSource = await readFile(new URL('../worker/index.mjs', import.meta.url), 'utf8');
   assert.equal(/electron|require\(|pluginPresenter/i.test(workerSource), false);
+});
+
+test('IOKit helper: reports, not process startup, establish availability; reconnect resets key state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'helper-status-'));
+  const host = new FakePluginHost();
+  let child;
+  try {
+    const inputPath = join(dir, 'events.jsonl');
+    const helperPath = join(dir, 'helper.mjs');
+    await writeFile(inputPath, '');
+    await writeFile(helperPath, `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+let cursor = 0;
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
+setInterval(() => {
+  const text = readFileSync(${JSON.stringify(inputPath)}, 'utf8');
+  const end = text.lastIndexOf('\\n') + 1;
+  if (end > cursor) { process.stdout.write(text.slice(cursor, end)); cursor = end; }
+}, 10);
+`);
+    await chmod(helperPath, 0o755);
+    await host.listen();
+    child = await startWorker(host, { VOKIE_HID_HELPER: helperPath });
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'helper-status' });
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+    const startup = await host.waitFor((m) => m.type === 'state' && m.extensions.device.hidSource === 'io-kit 助手', 'helper spawn');
+    assert.equal(startup.extensions.device.hidAvailable, false);
+
+    async function event(message, predicate) {
+      const from = host.messages.length;
+      await appendFile(inputPath, JSON.stringify(message) + '\n');
+      return host.waitFor((m) => m.type === 'state' && predicate(m.extensions.device), message.type, 5000, from);
+    }
+    await event({ type: 'permission', inputMonitoring: 'denied' }, (d) => d.hidInputMonitoring === 'denied');
+    await event({ type: 'started', seize: false }, (d) => d.hidSeizeFallback && !d.hidAvailable);
+    await event({ type: 'device', connected: true, collectionCount: 2 }, (d) => d.hidCollectionCount === 2 && !d.hidAvailable);
+    const report = { type: 'hid_report', data: Buffer.from([0x01, 0x07]).toString('base64') };
+    await event(report, (d) => d.hidAvailable && d.hidError === null);
+    await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'first key');
+
+    // Losing one collection must leave the other available, and duplicate
+    // reports from overlapping collections must not send a second Enter.
+    await event({ type: 'device', connected: true, collectionCount: 1 }, (d) => d.hidCollectionCount === 1 && d.hidAvailable);
+    await appendFile(inputPath, JSON.stringify(report) + '\n');
+    await event({ type: 'permission', inputMonitoring: 'granted' }, (d) => d.hidInputMonitoring === 'granted');
+    assert.equal(host.messages.filter((m) => m.type === 'command').length, 1);
+
+    await event({ type: 'device', connected: false, collectionCount: 0 }, (d) => !d.hidAvailable && d.hidCollectionCount === 0);
+    await event({ type: 'device', connected: true, collectionCount: 2 }, (d) => d.hidCollectionCount === 2 && !d.hidAvailable);
+    const from = host.messages.length;
+    await event(report, (d) => d.hidAvailable);
+    await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'key after reconnect', 5000, from);
+    assert.equal(host.messages.filter((m) => m.type === 'command').length, 2);
+
+    await event({ type: 'error', message: 'IOHIDManagerOpen: 独占访问冲突（0xE00002C5）', recoverable: true },
+      (d) => !d.hidAvailable && d.hidError.includes('0xE00002C5'));
+    await event({ type: 'started', seize: false }, (d) => !d.hidAvailable && d.hidSeizeFallback);
+    await event(report, (d) => d.hidAvailable && d.hidError === null);
+
+    // In auto mode, completing BLE voice setup must neither subscribe GATT
+    // HID nor stop the native helper. A further key still comes from helper.
+    await connectRemote(host, false);
+    assert.equal(host.messages.some((m) => m.type === 'ble_start_notify' && uuidEquals(m.characteristicUuid, ATVV.hidReport)), false);
+    await appendFile(inputPath, JSON.stringify({ type: 'hid_report', data: Buffer.from([1, 0]).toString('base64') }) + '\n');
+    const afterVoiceReady = host.messages.length;
+    await appendFile(inputPath, JSON.stringify(report) + '\n');
+    await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'native key after BLE ready', 5000, afterVoiceReady);
+    assert.equal(host.messages.filter((m) => m.type === 'state').at(-1).extensions.device.hidSource, 'io-kit 助手');
+
+    host.sendJson({ type: 'stop' });
+    await host.waitFor((m) => m.type === 'stopped', 'stopped');
+    const state = host.messages.filter((m) => m.type === 'state').at(-1);
+    assert.equal(state.extensions.device.hidAvailable, false);
+    assert.equal(state.extensions.device.hidSeized, false);
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    host.sendJson({ type: 'shutdown' });
+    await exited;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

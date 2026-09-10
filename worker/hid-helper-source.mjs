@@ -68,9 +68,14 @@ export class HidHelperSource {
   #restarts;
   #lineBuffer;
   #restartTimer;
+  #receiving = false;
 
   get running() {
     return this.#child !== null && this.#child.exitCode === null;
+  }
+
+  get receiving() {
+    return this.running && this.#receiving;
   }
 
   async start() {
@@ -96,6 +101,8 @@ export class HidHelperSource {
       destroyStreams(child);
     }
     this.#lineBuffer = '';
+    this.#receiving = false;
+    this.#onStatus({ running: false });
   }
 
   async #spawn() {
@@ -105,21 +112,28 @@ export class HidHelperSource {
     const child = spawn(this.#helperPath, this.#buildArgs(), { stdio: ['pipe', 'pipe', 'pipe'] });
     this.#child = child;
     this.#lineBuffer = '';
+    this.#receiving = false;
 
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => this.#consume(chunk));
+    child.stdout.on('data', (chunk) => {
+      if (this.#child === child && !this.#stopped) this.#consume(chunk);
+    });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       if (chunk.trim()) console.error('[chromecast-remote] hid helper:', chunk.trim());
     });
     child.on('error', (error) => {
+      if (this.#child !== child || this.#stopped) return;
       destroyStreams(child);
       this.#reportSpawnFailure(`无法启动 HID 助手：${error.message}`);
     });
     child.on('exit', (code, signal) => {
       destroyStreams(child);
-      if (this.#child === child) this.#child = null;
+      if (this.#child !== child) return;
+      this.#child = null;
       if (this.#stopped) return;
+      this.#receiving = false;
+      this.#onStatus({ running: false, error: `HID 助手已退出（code=${code} signal=${signal}），等待重启` });
       // Unexpected exit: bounded respawn, then give up for this run.
       this.#restarts += 1;
       if (this.#restarts > MAX_RESTARTS) {
@@ -157,6 +171,7 @@ export class HidHelperSource {
   #reportSpawnFailure(message) {
     if (this.#stopped) return;
     this.#stopped = true;
+    this.#receiving = false;
     this.#onStatus({ running: false, error: message });
   }
 
@@ -176,7 +191,10 @@ export class HidHelperSource {
       }
       if (message?.type === 'hid_report' && typeof message.data === 'string') {
         try {
-          this.#onReport(new Uint8Array(Buffer.from(message.data, 'base64')));
+          const bytes = new Uint8Array(Buffer.from(message.data, 'base64'));
+          if (bytes.length < 2 || bytes[0] !== 0x01) continue;
+          this.#receiving = true;
+          this.#onReport(bytes);
         } catch {
           // malformed base64; ignore the frame
         }
@@ -185,6 +203,9 @@ export class HidHelperSource {
       // started / device / error lines: surface them (e.g. the seize fallback
       // note) while the exit callback and stderr cover hard failures.
       if (message?.type && message.type !== 'hid_report') {
+        if (message.type === 'started' ||
+            (message.type === 'device' && message.connected === false) ||
+            message.type === 'error') this.#receiving = false;
         try {
           this.#onInfo(message);
         } catch {

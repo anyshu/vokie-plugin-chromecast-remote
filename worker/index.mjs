@@ -37,7 +37,7 @@ const manifest = {
   id: 'eb5f9200-de02-49bf-b602-57c49ebf78b9',
   name: 'Chromecast Voice Remote',
   device: { type: 'Chromecast Voice Remote', model: 'Google 18D1:9450' },
-  version: '0.2.4',
+  version: '0.2.6',
   apiVersion: '1',
   platforms: ['darwin'],
   transports: ['ble', 'hid'],
@@ -67,6 +67,8 @@ if (!wsUrl || !token) {
 const helperPath =
   process.env.VOKIE_HID_HELPER || fileURLToPath(new URL('../assets/chromecast-hid-helper', import.meta.url));
 
+console.error(`[cast-plugin] id=${manifest.id} version=${manifest.version} worker=${fileURLToPath(import.meta.url)} helper=${helperPath}`);
+
 let socket;
 let started = false;
 let config = { ...DEFAULT_CONFIG, hidSource: 'auto', hidSuppressNative: true };
@@ -85,6 +87,7 @@ function sendBinary(buffer) {
 // the opaque extensions object, replaced wholesale on every emission.
 
 const extensionState = {
+  package: { id: manifest.id, version: manifest.version },
   device: { connected: false, name: null, atvvVersion: null, codec: null, sampleRate: null, hidAvailable: false, hidSource: null, hidError: null },
   bluetooth: { phase: 'idle', cause: null, retryInMs: null },
   session: { mode: null, phase: 'idle', accepted: false, lastEndCause: null, lastEndAt: null },
@@ -160,42 +163,75 @@ const deviceSession = new DeviceSession({
 });
 
 // ---------------------------------------------------------------------------
-// HID button sources. Two mechanisms, at most one active at a time:
-//   1. HID-over-GATT notifications through the Host BLE adapter (works when
-//      the remote is not claimed by the macOS HID stack);
-//   2. the bundled IOKit helper binary (works when the remote is paired with
-//      macOS and the OS claims the HID service — the GATT subscription then
-//      gets `not_found`). In 'auto' mode the helper starts immediately and is
-//      stopped again if the GATT subscription succeeds on connect.
+// HID uses the plugin's native helper in auto/iohid mode. Host BLE owns ATVV
+// voice; standard HID over GATT is an explicit diagnostic option only. A GATT
+// subscription acknowledgement never disables the native button source.
 
 const hidHelper = new HidHelperSource({
   helperPath,
   buildArgs: () => (config.hidSuppressNative ? ['--seize'] : ['--observe']),
   onReport(bytes) {
-    for (const edge of hidParser.feed(bytes)) deviceSession.hidEvent(edge);
+    if (!started || config.hidSource === 'gatt') return;
+    const edges = hidParser.feed(bytes);
+    if (edges.length && (!extensionState.device.hidAvailable || extensionState.device.hidSource !== 'io-kit 助手')) {
+      updateExtensions('device', { hidAvailable: true, hidSource: 'io-kit 助手', hidError: null });
+      emitState(extensionState.device.connected ? 'connected' : 'starting');
+    }
+    for (const edge of edges) deviceSession.hidEvent(edge);
   },
   onInfo(message) {
-    // The helper degrades from seize to observe when the system denies
-    // exclusive access; buttons keep working but native keys are not
-    // suppressed. Surface that clearly.
+    // Opening a device or starting the process does not prove reports arrive.
     if (message.type === 'started') {
+      hidParser.reset();
       const seized = message.seize === true;
       updateExtensions('device', {
         hidSeizeFallback: config.hidSuppressNative && !seized,
-        hidSeized: seized
+        hidSeized: seized,
+        hidAvailable: false,
+        hidError: '等待遥控器按键报文'
       });
-      emitState(extensionState.device.connected ? 'connected' : 'starting');
+    } else if (message.type === 'device') {
+      updateExtensions('device', { hidCollectionCount: message.collectionCount ?? null });
+      if (message.connected === false) {
+        hidParser.reset();
+        updateExtensions('device', { hidAvailable: false, hidError: '等待遥控器 HID 接口连接' });
+      } else if (!hidHelper.receiving) {
+        updateExtensions('device', { hidError: '等待遥控器按键报文' });
+      }
+    } else if (message.type === 'permission') {
+      updateExtensions('device', { hidInputMonitoring: message.inputMonitoring });
+    } else if (message.type === 'error') {
+      hidParser.reset();
+      updateExtensions('device', { hidAvailable: false, hidError: String(message.message ?? 'HID 读取失败') });
+      console.error('[chromecast-remote] hid helper:', JSON.stringify(message));
+    } else if (message.type === 'raw_report') {
+      const count = (extensionState.device.hidRawReportCount ?? 0) + 1;
+      updateExtensions('device', { hidRawReportCount: count, hidLastRawReport: message });
+      if (count <= 20) console.error('[cast-hid] raw:', JSON.stringify(message));
+    } else if (message.type === 'collection') {
+      console.error('[chromecast-remote] hid collection:', JSON.stringify(message));
+      return;
+    } else {
+      return;
     }
+    emitState(extensionState.device.connected ? 'connected' : 'starting');
   },
   onStatus(info) {
+    hidParser.reset();
     if (info.running) {
-      updateExtensions('device', { hidAvailable: true, hidSource: 'io-kit 助手', hidError: null });
+      updateExtensions('device', {
+        hidAvailable: false, hidSource: 'io-kit 助手', hidError: '等待遥控器按键报文',
+        hidSeized: false, hidSeizeFallback: false, hidCollectionCount: 0, hidInputMonitoring: null,
+        hidRawReportCount: 0, hidLastRawReport: null
+      });
     } else {
-      const viaGatt = transport.hidSubscribed === true;
+      const viaGatt = config.hidSource === 'gatt' && transport.hidSubscribed === true;
       updateExtensions('device', {
         hidAvailable: viaGatt,
         hidSource: viaGatt ? 'gatt' : null,
-        hidError: info.error ?? null
+        hidError: info.error ?? null,
+        hidSeized: false, hidSeizeFallback: false, hidCollectionCount: 0, hidInputMonitoring: null,
+        hidRawReportCount: 0, hidLastRawReport: null
       });
     }
     emitState(extensionState.device.connected ? 'connected' : 'starting');
@@ -207,21 +243,21 @@ const hidHelper = new HidHelperSource({
 
 const transport = new BleTransport({
   send,
-  subscribeHid: config.hidSource !== 'iohid',
-  onReady({ name, atvv, hidSubscribed }) {
+  subscribeHid: config.hidSource === 'gatt',
+  onReady({ deviceId, name, atvv, hidSubscribed }) {
     deviceSession.deviceReady({ name, atvv, hidSubscribed });
     hidParser.reset();
-    const viaGatt = hidSubscribed === true;
-    const viaHelper = !viaGatt && hidHelper.running;
-    if (viaGatt) hidHelper.stop(); // single button source
+    const viaGatt = config.hidSource === 'gatt' && hidSubscribed === true;
+    const viaHelper = !viaGatt && hidHelper.receiving;
     updateExtensions('device', {
       connected: true,
+      bleDeviceId: deviceId,
       name: name ?? null,
       atvvVersion: atvv.version,
       codec: `ADPCM ${atvv.sampleRate / 1000} kHz`,
       sampleRate: atvv.sampleRate,
       hidAvailable: viaGatt || viaHelper,
-      hidSource: viaGatt ? 'gatt' : viaHelper ? 'io-kit 助手' : null
+      hidSource: viaGatt ? 'gatt' : config.hidSource !== 'gatt' ? 'io-kit 助手' : null
     });
     if (viaGatt || viaHelper) updateExtensions('device', { hidError: null });
     updateExtensions('bluetooth', { phase: 'connected', cause: null, retryInMs: null });
@@ -233,19 +269,29 @@ const transport = new BleTransport({
       deviceSession.controlEvent(parseControlEvent(data, deviceSession.atvv));
     } else if (uuidEquals(characteristicUuid, ATVV_AUDIO_UUID)) {
       deviceSession.audioData(data);
-    } else if (uuidEquals(characteristicUuid, HID_REPORT_UUID)) {
+    } else if (config.hidSource === 'gatt' && transport.hidSubscribed && uuidEquals(characteristicUuid, HID_REPORT_UUID)) {
       for (const edge of hidParser.feed(data)) deviceSession.hidEvent(edge);
     }
   },
   onDeviceLost(reason) {
     deviceSession.deviceLost(); // ends any active session (session_cancel)
-    hidParser.reset();
-    updateExtensions('device', { connected: false, hidAvailable: false });
+    if (config.hidSource === 'gatt') hidParser.reset();
+    updateExtensions('device', {
+      connected: false, bleDeviceId: null,
+      hidAvailable: config.hidSource !== 'gatt' && hidHelper.receiving,
+      hidSource: config.hidSource !== 'gatt' ? 'io-kit 助手' : null
+    });
     updateExtensions('bluetooth', { phase: 'scanning', cause: `设备断开：${reason}` });
     updateExtensions('session', { mode: null, phase: 'idle', gesture: null, accepted: false });
     emitState('starting');
   },
   onStatus(info) {
+    if (info.requestFailure) {
+      console.error('[cast-ble] request failed:', JSON.stringify(info.requestFailure));
+      updateExtensions('bluetooth', { lastRequestFailure: info.requestFailure });
+      emitState(extensionState.device.connected ? 'connected' : 'starting');
+      return;
+    }
     if (info.phase === 'error') {
       updateExtensions('bluetooth', { phase: 'error', cause: info.message, retryInMs: null });
       updateExtensions('device', { connected: false });
@@ -254,16 +300,19 @@ const transport = new BleTransport({
     }
     const cause = info.cause ?? null;
     if (info.hidAvailable === false) {
-      // GATT HID unavailable on this device/link: fall back to the IOKit
-      // helper when it is running (paired-remote configuration).
-      const viaHelper = hidHelper.running;
+      // Explicit GATT mode never silently switches to a native source.
+      const viaHelper = hidHelper.receiving;
       updateExtensions('device', {
         hidAvailable: viaHelper,
         hidSource: viaHelper ? 'io-kit 助手' : null,
-        hidError: viaHelper ? null : (info.hidError ?? 'HID 通知不可用')
+        hidError: viaHelper ? null : (extensionState.device.hidError ?? info.hidError ?? 'HID 通知不可用')
       });
     }
-    updateExtensions('bluetooth', { phase: info.phase, cause, retryInMs: info.retryInMs ?? null });
+    if (info.selectedDeviceId !== undefined) {
+      console.error('[cast-ble] selection:', JSON.stringify(info));
+      updateExtensions('bluetooth', { selectedDeviceId: info.selectedDeviceId, selectedDeviceName: info.selectedDeviceName });
+    }
+    updateExtensions('bluetooth', { ...(info.phase ? { phase: info.phase } : {}), cause, retryInMs: info.retryInMs ?? null });
     emitState(info.phase === 'connected' ? 'connected' : 'starting');
   }
 });
@@ -371,8 +420,15 @@ function handleHostMessage(message) {
       const previous = config;
       config = result.value;
       deviceSession.setConfig(config);
-      // GATT HID subscription preference applies from the next device connect.
-      transport.subscribeHid = config.hidSource !== 'iohid';
+      // Changing the native/GATT choice requires a new subscription lifecycle.
+      transport.subscribeHid = config.hidSource === 'gatt';
+      if (started && (config.hidSource === 'gatt') !== (previous.hidSource === 'gatt')) {
+        deviceSession.deviceLost();
+        hidParser.reset();
+        transport.stop();
+        updateExtensions('device', { connected: false, bleDeviceId: null, hidAvailable: false });
+        transport.start(); // waits for the old backend link to finish releasing
+      }
       // Keep the helper aligned with the new settings.
       if (config.hidSource === 'gatt') {
         hidHelper.stop();
