@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chromecast Voice Remote</title>
+  <style>
+    :root { color-scheme: light dark; font: 13px system-ui, -apple-system, sans-serif; }
+    body { margin: 0; padding: 10px 14px 12px; color: #172033; background: #fff; }
+    @media (prefers-color-scheme: dark) { body { color: #edf2f7; background: #111827; } }
+    .muted { color: #64748b; }
+    @media (prefers-color-scheme: dark) { .muted { color: #a9b5c6; } }
+    .header { display: flex; align-items: center; gap: 8px; }
+    .icon { width: 22px; height: 22px; border-radius: 5px; }
+    h1 { font-size: 15px; margin: 0; }
+    .status { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-weight: 600; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; flex: none; }
+    .dot.starting { background: #f59e0b; } .dot.connected { background: #16a34a; }
+    .dot.recording { background: #dc2626; } .dot.error { background: #dc2626; } .dot.stopped { background: #64748b; }
+    .meta { margin: 3px 0 0; line-height: 1.5; }
+    section { margin-top: 10px; }
+    h2 { font-size: 13px; margin: 0 0 6px; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+    .row > label { min-width: 108px; }
+    select { padding: 3px 6px; border-radius: 5px; border: 1px solid #94a3b8; background: transparent; color: inherit; width: 200px; }
+    input[type=checkbox] { width: 15px; height: 15px; }
+    .hint { font-size: 12px; margin: 2px 0 0; }
+    .feedback { font-size: 12px; min-height: 16px; }
+    .feedback.ok { color: #16a34a; }
+    .feedback.err { color: #dc2626; }
+    .keys { font-size: 12px; margin: 0; line-height: 1.6; }
+    kbd { display: inline-block; padding: 0 6px; border-radius: 4px; border: 1px solid currentColor; font: 11px ui-monospace, monospace; opacity: .85; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <img class="icon" src="../assets/icon.svg" alt="" />
+    <h1>Chromecast Voice Remote</h1>
+  </header>
+
+  <div class="status"><span id="dot" class="dot"></span><span id="status">正在读取插件状态…</span></div>
+  <p id="meta-device" class="meta muted">—</p>
+  <p id="meta-session" class="meta muted">—</p>
+
+  <section>
+    <h2>设置 <span class="feedback" id="feedback"></span></h2>
+    <div class="row">
+      <label for="voice-mode">语音键模式</label>
+      <select id="voice-mode">
+        <option value="hold">长按模式（PTT）</option>
+        <option value="tap">短按模式（Hands-free PTT）</option>
+      </select>
+    </div>
+    <p id="mode-hint" class="hint muted">—</p>
+    <div class="row">
+      <label for="hid-source">按键来源</label>
+      <select id="hid-source">
+        <option value="auto">自动</option>
+        <option value="gatt">仅 GATT</option>
+        <option value="iohid">仅 IOKit 助手</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="hid-seize">拦截原生按键</label>
+      <input id="hid-seize" type="checkbox" checked />
+      <span class="hint muted">确认/返回/方向键不再作用于系统，只发给 Vokie</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>按键</h2>
+    <p class="keys muted"><kbd>语音键</kbd> 录音（按左侧所选模式） ｜ <kbd>返回键</kbd> 撤销上一次输出 ｜ <kbd>确认键</kbd> 发送（回车确认）</p>
+  </section>
+
+<script src="../assets/vokie-plugin-sdk.js"></script>
+<script>
+  const labels = { starting: '正在扫描遥控器', ready: '插件已就绪', connected: '遥控器已连接', recording: '正在录音', stopped: '插件已停止', error: '连接错误' };
+  const phaseLabels = { scanning: '扫描中', connecting: '连接中', negotiating: '协商中', connected: '已连接', backoff: '等待重试', error: '错误', idle: '未启动' };
+  const modeHints = {
+    hold: '长按模式：按下语音键立即开始录音，松开结束（PTT）',
+    tap: '短按模式：按一下语音键开始录音，再按一下结束（Hands-free PTT）'
+  };
+  const el = (id) => document.getElementById(id);
+  let saveInFlight = false; // don't clobber controls while a change is applying
+
+  function render(state) {
+    // The Host's get_state response may carry the core status as `status`
+    // (runtime view) or `state` (wire shape); read both before falling back.
+    const value = state?.status || state?.state || 'stopped';
+    el('status').textContent = labels[value] || value;
+    el('dot').className = `dot ${value}`;
+    const ext = state?.extensions || {};
+    const device = ext.device || {};
+    const bt = ext.bluetooth || {};
+    const session = ext.session || {};
+    const settings = ext.settings || {};
+
+    // Compact device line.
+    const parts = [];
+    if (device.connected) {
+      parts.push(device.name || '已连接');
+      if (device.codec) parts.push(`${device.codec} · ATVV ${device.atvvVersion || '?'}`);
+      if (device.hidAvailable === true) {
+        let hid = `按键：${device.hidSource === 'gatt' ? 'GATT' : 'IOKit 助手'}`;
+        if (device.hidSeizeFallback) hid += '（旁听：原生按键未拦截）';
+        parts.push(hid);
+      } else if (device.hidAvailable === false) {
+        parts.push(`按键：不可用${device.hidError ? `（${device.hidError}）` : ''}`);
+      }
+    } else {
+      parts.push(value === 'stopped' ? '插件未启动' : (phaseLabels[bt.phase] || bt.phase || '未连接'));
+      if (bt.cause && value !== 'stopped') parts.push(bt.cause);
+    }
+    el('meta-device').textContent = parts.join(' · ');
+
+    // Session line.
+    const sessionParts = [];
+    if (session.mode) sessionParts.push(`${session.mode}${session.accepted ? ' · 录音中' : ' · 等待接受'}`);
+    if (session.lastEndCause) sessionParts.push(`上次结束：${session.lastEndCause}`);
+    el('meta-session').textContent = sessionParts.join(' · ') || '无进行中的会话';
+
+    el('mode-hint').textContent = modeHints[settings.voiceMode || 'hold'];
+    if (saveInFlight) return; // keep the user's in-flight change on screen
+    el('voice-mode').value = settings.voiceMode || 'hold';
+    el('hid-source').value = settings.hidSource || 'auto';
+    el('hid-seize').checked = settings.hidSuppressNative !== false;
+  }
+
+  render({ state: 'starting' });
+  async function refreshState() {
+    if (!window.vokiePlugin) return;
+    try {
+      const response = await vokiePlugin.getState();
+      render(response?.state ?? response);
+    } catch {
+      render({ state: 'error' });
+    }
+  }
+  refreshState();
+  const stateTimer = setInterval(refreshState, 1000);
+  window.addEventListener('unload', () => clearInterval(stateTimer), { once: true });
+
+  // Changes apply immediately: the UI sends the patch to the Host through the
+  // configure bridge, the Host persists it once the worker acknowledges, and
+  // the next gesture uses the new value.
+  const feedback = el('feedback');
+  async function applySetting(patch, describe) {
+    saveInFlight = true;
+    feedback.className = 'feedback';
+    feedback.textContent = `${describe} 保存中…`;
+    try {
+      await vokiePlugin.configure(patch);
+      feedback.className = 'feedback ok';
+      feedback.textContent = `✓ ${describe} 已生效`;
+      await refreshState();
+    } catch (error) {
+      feedback.className = 'feedback err';
+      feedback.textContent = `× ${describe} 保存失败：${error.message}`;
+      await refreshState(); // revert the control to the persisted value
+    } finally {
+      saveInFlight = false;
+    }
+  }
+  el('voice-mode').addEventListener('change', (event) => {
+    applySetting({ voiceMode: event.target.value }, event.target.value === 'tap' ? '短按模式' : '长按模式');
+  });
+  el('hid-source').addEventListener('change', (event) => {
+    const label = { auto: '自动', gatt: '仅 GATT', iohid: '仅 IOKit 助手' }[event.target.value];
+    applySetting({ hidSource: event.target.value }, `按键来源（${label}）`);
+  });
+  el('hid-seize').addEventListener('change', (event) => {
+    applySetting({ hidSuppressNative: event.target.checked }, '拦截原生按键');
+  });
+</script>
+</body>
+</html>

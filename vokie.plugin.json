@@ -1,0 +1,22 @@
+{
+  "id": "eb5f9200-de02-49bf-b602-57c49ebf78b9",
+  "name": "Chromecast Voice Remote",
+  "device": { "type": "Chromecast Voice Remote", "model": "Google 18D1:9450" },
+  "version": "0.2.4",
+  "apiVersion": "1",
+  "platforms": ["darwin"],
+  "transports": ["ble", "hid"],
+  "capabilities": {
+    "ptt": true,
+    "handsfree": true,
+    "longRecording": false,
+    "translation": false,
+    "liveTranslation": false,
+    "sendEnter": true,
+    "undoLastOutput": true
+  },
+  "permissions": ["bluetooth", "native-helper"],
+  "icon": "assets/icon.svg",
+  "ui": { "entrypoint": "ui/index.html" },
+  "worker": { "entrypoint": "worker/index.mjs", "args": [] }
+}

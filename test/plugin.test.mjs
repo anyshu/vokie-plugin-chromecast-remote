@@ -1,0 +1,361 @@
+// End-to-end tests: the real worker process against a fake Vokie Host and a
+// fake Chromecast Voice Remote simulated through the Host BLE adapter
+// messages. Covers handshake, lifecycle, both voice-key modes (hold = ptt,
+// tap = handsfree-ptt), mode switching via configuration, audio frames, HID
+// commands from GATT and from the IOKit helper, and cleanup — no physical
+// device required.
+
+import assert from 'node:assert/strict';
+import { readFile, writeFile, chmod, mkdtemp, rm } from 'node:fs/promises';
+import { test } from 'node:test';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { uuidEquals } from '../worker/ble-transport.mjs';
+import {
+  ATVV,
+  FakePluginHost,
+  audioStartHost,
+  audioStartPhysical,
+  audioStopPhysical,
+  capabilitiesV10,
+  hidReport,
+  parseAudioFrame
+} from './helpers.mjs';
+
+const workerEntry = fileURLToPath(new URL('../worker/index.mjs', import.meta.url));
+const manifestPath = fileURLToPath(new URL('../vokie.plugin.json', import.meta.url));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function notification(host, characteristicUuid, bytes) {
+  host.sendJson({
+    type: 'ble_notification',
+    deviceId: DEVICE_ID,
+    characteristicUuid,
+    dataBase64: Buffer.from(bytes).toString('base64')
+  });
+}
+
+const DEVICE_ID = 'fake-chromecast-1';
+
+async function startWorker(host, extraEnv = {}) {
+  const child = spawn(process.execPath, [workerEntry], {
+    env: {
+      ...process.env,
+      VOKIE_PLUGIN_WS_URL: `ws://127.0.0.1:${host.port}`,
+      VOKIE_PLUGIN_TOKEN: 'one-time-token',
+      ...extraEnv
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => process.stderr.write(`[worker] ${chunk}`));
+  return child;
+}
+
+/** Drive the adapter handshake until the remote is connected. */
+async function connectRemote(host) {
+  const scan = await host.waitFor((m) => m.type === 'ble_scan', 'ble_scan');
+  host.sendJson({
+    type: 'ble_scan_result',
+    requestId: scan.requestId,
+    devices: [{ deviceId: DEVICE_ID, name: 'Chromecast Remote', serviceUuids: [ATVV.service], rssi: -42 }]
+  });
+  const connect = await host.waitFor((m) => m.type === 'ble_connect', 'ble_connect');
+  host.sendJson({ type: 'ble_accepted', requestId: connect.requestId });
+  for (const characteristic of [ATVV.control, ATVV.audio, ATVV.hidReport, ATVV.command]) {
+    const notify = await host.waitFor(
+      (m) => m.type === 'ble_start_notify' && uuidEquals(m.characteristicUuid, characteristic),
+      `notify ${characteristic}`
+    );
+    host.sendJson({ type: 'ble_accepted', requestId: notify.requestId });
+  }
+  const write = await host.waitFor((m) => m.type === 'ble_write', 'getCapabilities write');
+  assert.deepEqual([...Buffer.from(write.dataBase64, 'base64')], [0x0a, 0x01, 0x00, 0x00, 0x03, 0x03]);
+  host.sendJson({ type: 'ble_accepted', requestId: write.requestId });
+  notification(host, ATVV.control, capabilitiesV10());
+  await host.waitFor((m) => m.type === 'state' && m.state === 'connected', 'state connected');
+}
+
+test('full lifecycle: handshake, hold mode, tap mode, commands, config, stop, shutdown', async () => {
+  const host = new FakePluginHost();
+  await host.listen();
+  const child = await startWorker(host);
+  try {
+    // --- Handshake: plugin_hello first, echoing the on-disk manifest.
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'plugin_hello');
+    assert.equal(host.messages[0].type, 'plugin_hello');
+    assert.equal(hello.token, 'one-time-token');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    for (const field of ['id', 'name', 'version', 'apiVersion', 'platforms', 'transports', 'capabilities', 'permissions', 'icon', 'ui']) {
+      assert.deepEqual(hello.manifest[field], manifest[field], `manifest field ${field} must match vokie.plugin.json`);
+    }
+    host.sendJson({ type: 'handshake_ok', pluginId: manifest.id, connectionId: 'conn-1' });
+
+    host.sendJson({ type: 'initialize' });
+    await host.waitFor((m) => m.type === 'initialized', 'initialized');
+
+    // Host pushes persisted configuration before start.
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: {} });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-1', 'configured cfg-1');
+
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+    await host.waitFor((m) => m.type === 'state' && m.state === 'starting', 'state starting');
+
+    await connectRemote(host);
+    const stateConnected = host.messages.find((m) => m.type === 'state' && m.state === 'connected');
+    assert.equal(stateConnected.extensions.device.name, 'Chromecast Remote');
+    assert.equal(stateConnected.extensions.device.atvvVersion, '1.0');
+    assert.equal(stateConnected.extensions.device.hidAvailable, true);
+    assert.equal(stateConnected.extensions.settings.voiceMode, 'hold');
+
+    // --- Hold mode (default): the key IS push-to-talk. A press starts the
+    // ptt session immediately (no threshold); release stops it — even a
+    // quick tap is just a very short session.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 6 }));
+    await delay(150);
+    notification(host, ATVV.control, audioStopPhysical());
+    const briefStart = await host.waitFor((m) => m.type === 'session_start' && m.mode === 'ptt', 'brief ptt session_start');
+    host.sendJson({ type: 'session_accepted', requestId: briefStart.requestId, sessionId: 's-0', mode: 'ptt' });
+    await host.waitFor((m) => m.type === 'session_stop' && m.requestId === briefStart.requestId, 'brief session stops at release');
+
+    // --- Hold mode: press -> talk -> release, with buffered pre-acceptance
+    // audio flushed after acceptance.
+    const briefStopIndex = host.messages.findIndex((m) => m.type === 'session_stop' && m.requestId === briefStart.requestId);
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 10 }));
+    notification(host, ATVV.audio, Uint8Array.of(0x77)); // arrives during the acceptance round-trip
+    // The session must start at key-down, not after any threshold delay.
+    const holdStart = await host.waitFor(
+      (m) => m.type === 'session_start' && m.mode === 'ptt',
+      'ptt session_start at key-down',
+      300, // well below the removed 550 ms threshold
+      briefStopIndex + 1 // exclude the brief session's own start
+    );
+    host.sendJson({ type: 'session_accepted', requestId: holdStart.requestId, sessionId: 's-1', mode: 'ptt' });
+    // Pre-acceptance audio [11, 41] is flushed first.
+    const holdFrame = await host.waitFor((m) => m.type === 'audio_frame' && m.header.requestId === holdStart.requestId, 'hold audio frame');
+    assert.deepEqual([...holdFrame.pcm], [0x0b, 0x00, 0x29, 0x00]);
+    notification(host, ATVV.control, audioStopPhysical());
+    await host.waitFor((m) => m.type === 'session_stop' && m.requestId === holdStart.requestId, 'hold session_stop');
+    await host.waitFor(
+      (m) => m.type === 'ble_write' && Buffer.from(m.dataBase64, 'base64')[0] === 0x0d,
+      'micClose after hold'
+    );
+
+    // --- Switch to tap mode.
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-2', config: { voiceMode: 'tap' } });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-2', 'configured cfg-2');
+
+    // --- Tap mode: ANY press duration toggles (no threshold). A slow press
+    // (700 ms, above the hold threshold) still opens the session.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 8 }));
+    await delay(700); // beyond the 550 ms threshold — still a toggle press
+    notification(host, ATVV.control, audioStopPhysical());
+    const slowToggleStart = await host.waitFor((m) => m.type === 'session_start' && m.mode === 'handsfree-ptt', 'slow toggle session_start');
+    const slowMicOpen = await host.waitFor(
+      (m) => m.type === 'ble_write' && Buffer.from(m.dataBase64, 'base64')[0] === 0x0c,
+      'micOpen write (slow toggle)'
+    );
+    host.sendJson({ type: 'ble_accepted', requestId: slowMicOpen.requestId });
+    host.sendJson({ type: 'session_accepted', requestId: slowToggleStart.requestId, sessionId: 's-2a', mode: 'handsfree-ptt' });
+    notification(host, ATVV.control, audioStartHost({ streamId: 9 }));
+    // Toggle off again with a quick press.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 10 }));
+    await delay(150);
+    notification(host, ATVV.control, audioStopPhysical());
+    await host.waitFor((m) => m.type === 'session_stop' && m.requestId === slowToggleStart.requestId, 'slow toggle session_stop');
+    await host.waitFor(
+      (m) => m.type === 'ble_write' && Buffer.from(m.dataBase64, 'base64')[0] === 0x0d,
+      'micClose write (slow toggle)',
+      5000,
+      host.messages.findIndex((m) => m.requestId === slowMicOpen.requestId) + 1
+    );
+
+    // --- Tap mode: a quick tap opens a handsfree-ptt session with a persistent mic.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 7 }));
+    notification(host, ATVV.audio, Uint8Array.of(0x77, 0x00)); // tap audio
+    await delay(200);
+    notification(host, ATVV.control, audioStopPhysical());
+
+    const tapStart = await host.waitFor(
+      (m) => m.type === 'session_start' && m.mode === 'handsfree-ptt',
+      'handsfree session_start',
+      5000,
+      host.messages.findIndex((m) => m.requestId === slowToggleStart.requestId) + 1
+    );
+    assert.deepEqual(tapStart.options.audioSource, { type: 'stream', format: 'pcm_s16le', sampleRate: 16000, channels: 1 });
+    const micOpen = await host.waitFor(
+      (m) => m.type === 'ble_write' && Buffer.from(m.dataBase64, 'base64')[0] === 0x0c,
+      'micOpen write',
+      5000,
+      host.messages.findIndex((m) => m.requestId === slowMicOpen.requestId) + 1
+    );
+    assert.deepEqual([...Buffer.from(micOpen.dataBase64, 'base64')], [0x0c, 0x00]);
+    host.sendJson({ type: 'ble_accepted', requestId: micOpen.requestId });
+    host.sendJson({ type: 'session_accepted', requestId: tapStart.requestId, sessionId: 's-2', mode: 'handsfree-ptt' });
+    await host.waitFor(
+      (m) => m.type === 'state' && m.state === 'recording',
+      'state recording',
+      5000,
+      host.messages.findIndex((m) => m.requestId === tapStart.requestId) + 1
+    );
+
+    // Persistent stream confirmed + live audio -> ordered binary frames.
+    notification(host, ATVV.control, audioStartHost({ streamId: 13 }));
+    const frame1 = await host.waitFor((m) => m.type === 'audio_frame' && m.header.requestId === tapStart.requestId, 'first audio frame');
+    assert.equal(frame1.header.sequence, 0);
+    assert.equal(frame1.header.sampleRate, 16000);
+    // Buffered tap audio [11, 41, 45, 48] is flushed first (little-endian s16).
+    assert.deepEqual([...frame1.pcm], [0x0b, 0x00, 0x29, 0x00, 0x2d, 0x00, 0x30, 0x00]);
+    // The persistent stream restarts the decoder; same nibbles, same samples.
+    notification(host, ATVV.audio, Uint8Array.of(0x77, 0x00));
+    const frame2 = await host.waitFor((m) => m.type === 'audio_frame' && m.header.sequence === 1, 'second audio frame');
+    assert.deepEqual([...frame2.pcm], [0x0b, 0x00, 0x29, 0x00, 0x2d, 0x00, 0x30, 0x00]);
+    // Continued stream decodes with running state: [51, 54].
+    notification(host, ATVV.audio, Uint8Array.of(0x00));
+    const frame3 = await host.waitFor((m) => m.type === 'audio_frame' && m.header.sequence === 2, 'third audio frame');
+    assert.deepEqual([...frame3.pcm], [0x33, 0x00, 0x36, 0x00]);
+
+    // --- Second tap closes the session.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 11 }));
+    await delay(150);
+    notification(host, ATVV.control, audioStopPhysical());
+    await host.waitFor((m) => m.type === 'session_stop' && m.requestId === tapStart.requestId, 'session_stop');
+    const micOpenIndex = host.messages.findIndex((m) => m.requestId === micOpen.requestId);
+    const micClose = await host.waitFor(
+      (m) => m.type === 'ble_write' && Buffer.from(m.dataBase64, 'base64')[0] === 0x0d,
+      'micClose write',
+      5000,
+      micOpenIndex + 1 // exclude the hold section's earlier MIC_CLOSE
+    );
+    assert.deepEqual([...Buffer.from(micClose.dataBase64, 'base64')], [0x0d, 0x0b]);
+    host.sendJson({ type: 'ble_accepted', requestId: micClose.requestId });
+
+    // --- HID buttons over GATT: select -> send_enter, back -> undo_last_output.
+    notification(host, ATVV.hidReport, hidReport(0x07));
+    const enter = await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'send_enter');
+    assert.ok(enter.requestId);
+    notification(host, ATVV.hidReport, hidReport(0x00)); // release
+    notification(host, ATVV.hidReport, hidReport(0x0b));
+    await host.waitFor((m) => m.type === 'command' && m.command === 'undo_last_output', 'undo_last_output');
+    notification(host, ATVV.hidReport, hidReport(0x00));
+
+    // --- Configuration: invalid value rejected, runtime config untouched.
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-3', config: { voiceMode: 'bogus' } });
+    const rejected = await host.waitFor((m) => m.type === 'configuration_rejected' && m.requestId === 'cfg-3', 'rejected cfg-3');
+    assert.ok(rejected.error.includes('voiceMode'));
+    // Legacy keys (tapMode/holdMode/holdThresholdMs) are dropped silently so a
+    // persisted old configuration can never block the plugin start.
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-4', config: { tapMode: 'ptt', holdThresholdMs: 550 } });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-4', 'configured cfg-4 with legacy keys');
+    const settingsAfterLegacy = host.messages.filter((m) => m.type === 'state').at(-1)?.extensions?.settings;
+    assert.equal(settingsAfterLegacy?.voiceMode, 'tap'); // unchanged by the legacy payload
+
+    // --- Device loss mid-session cancels it.
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 12 }));
+    await delay(200);
+    notification(host, ATVV.control, audioStopPhysical());
+    const tapStart3 = await host.waitFor(
+      (m) => m.type === 'session_start',
+      'third session',
+      5000,
+      host.messages.findIndex((m) => m.requestId === 'cfg-4') + 1
+    );
+    host.sendJson({ type: 'session_accepted', requestId: tapStart3.requestId, sessionId: 's-3', mode: 'handsfree-ptt' });
+    await delay(100);
+    host.sendJson({ type: 'ble_disconnected', deviceId: DEVICE_ID, reason: 'link_lost' });
+    await host.waitFor((m) => m.type === 'session_cancel' && m.requestId === tapStart3.requestId, 'session_cancel on device loss');
+    const cancelIndex = host.messages.findIndex((m) => m.type === 'session_cancel' && m.requestId === tapStart3.requestId);
+    await host.waitFor((m) => m.type === 'state' && m.state === 'starting', 'back to scanning', 5000, cancelIndex + 1);
+    // The end cause is surfaced in extensions for the settings page.
+    const afterLoss = host.messages
+      .slice(cancelIndex)
+      .filter((m) => m.type === 'state')
+      .at(-1);
+    assert.ok(afterLoss.extensions.session.lastEndCause.includes('device_lost'), afterLoss.extensions.session.lastEndCause);
+
+    // --- stop: clean device release, stopped ack.
+    host.sendJson({ type: 'stop', reason: 'user' });
+    await host.waitFor((m) => m.type === 'stopped', 'stopped ack');
+    await host.waitFor((m) => m.type === 'state' && m.state === 'stopped', 'state stopped');
+
+    // --- restart + shutdown: destroyed + socket close + process exit.
+    host.sendJson({ type: 'start' });
+    const stoppedIndex = host.messages.map((m) => m.type).lastIndexOf('stopped');
+    await host.waitFor((m) => m.type === 'ready', 'ready after restart', 5000, stoppedIndex + 1);
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    await exited;
+  } finally {
+    child.kill('SIGKILL');
+    await host.close();
+  }
+});
+
+test('IOKit helper: buttons work without any BLE link', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'helper-e2e-'));
+  try {
+    const selectReport = Buffer.from(Uint8Array.of(0x01, 0x07)).toString('base64');
+    const helperPath = join(dir, 'fake-hid-helper.mjs');
+    await writeFile(
+      helperPath,
+      '#!/usr/bin/env node\n' +
+        'process.stdin.resume();\n' +
+        'process.stdin.on("end", () => process.exit(0));\n' +
+        `process.stdout.write(JSON.stringify({ type: "hid_report", data: ${JSON.stringify(selectReport)} }) + "\\n");\n` +
+        'setInterval(() => {}, 60000);\n',
+      'utf8'
+    );
+    await chmod(helperPath, 0o755);
+
+    const host = new FakePluginHost();
+    await host.listen();
+    const child = await startWorker(host, { VOKIE_HID_HELPER: helperPath });
+    try {
+      const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'plugin_hello');
+      host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'conn-2' });
+      host.sendJson({ type: 'initialize' });
+      await host.waitFor((m) => m.type === 'initialized', 'initialized');
+      host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: {} });
+      await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-1', 'configured');
+      host.sendJson({ type: 'start' });
+      await host.waitFor((m) => m.type === 'ready', 'ready');
+
+      // The helper is spawned at start; its report becomes a send_enter
+      // command even though no BLE device ever connects.
+      const enter = await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'send_enter from helper');
+      assert.ok(enter.requestId);
+
+      // Extensions report the helper as the button source.
+      const state = host.messages.filter((m) => m.type === 'state').at(-1);
+      assert.equal(state.extensions.device.hidAvailable, true);
+      assert.equal(state.extensions.device.hidSource, 'io-kit 助手');
+
+      host.sendJson({ type: 'shutdown' });
+      await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+      const exited = new Promise((resolve) => child.on('exit', resolve));
+      await exited;
+      // The helper exits on stdin EOF once the worker is gone.
+      await delay(300);
+    } finally {
+      child.kill('SIGKILL');
+      await host.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('manifest files resolve and worker has no Electron dependency', async () => {
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const packageRoot = new URL('../', import.meta.url);
+  for (const relative of [manifest.icon, manifest.ui.entrypoint, manifest.worker.entrypoint]) {
+    const url = new URL(relative, packageRoot);
+    await readFile(url, 'utf8'); // throws when the path does not resolve
+  }
+  const workerSource = await readFile(new URL('../worker/index.mjs', import.meta.url), 'utf8');
+  assert.equal(/electron|require\(|pluginPresenter/i.test(workerSource), false);
+});
