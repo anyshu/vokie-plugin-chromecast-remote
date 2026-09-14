@@ -16,11 +16,15 @@ import { uuidEquals } from '../worker/ble-transport.mjs';
 import {
   ATVV,
   FakePluginHost,
+  FakeHciDaemon,
   audioStartHost,
   audioStartPhysical,
   audioStopPhysical,
   capabilitiesV10,
   hidReport,
+  nhdrBackDown,
+  nhdrButtonUp,
+  nhdrSelectDown,
   parseAudioFrame
 } from './helpers.mjs';
 
@@ -45,8 +49,11 @@ async function startWorker(host, extraEnv = {}) {
       ...process.env,
       VOKIE_PLUGIN_WS_URL: `ws://127.0.0.1:${host.port}`,
       VOKIE_PLUGIN_TOKEN: 'one-time-token',
-      // Tests must not open real HID devices or trigger system permission UI.
+      // Tests must not open real HID devices, trigger system permission UI,
+      // or reach the real privileged HCI daemon (a capture start would reload
+      // the machine's bluetoothd).
       VOKIE_HID_HELPER: '/nonexistent/test-hid-helper',
+      VOKIE_HCI_SOCKET: '/nonexistent/test-hci.sock',
       ...extraEnv
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -347,6 +354,138 @@ test('IOKit helper: buttons work without any BLE link', async () => {
       await host.close();
     }
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('HCI capture: buttons work without any BLE link (the macOS 26.5 path)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-e2e-'));
+  const daemon = new FakeHciDaemon();
+  await daemon.listen(join(dir, 'hci.sock'));
+  const host = new FakePluginHost();
+  let child;
+  try {
+    await host.listen();
+    child = await startWorker(host, { VOKIE_HCI_SOCKET: join(dir, 'hci.sock') });
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'hci-e2e' });
+    host.sendJson({ type: 'initialize' });
+    await host.waitFor((m) => m.type === 'initialized', 'initialized');
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: { hidSource: 'hci' } });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-1', 'configured');
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+
+    // The capture starts even though no BLE device ever connects.
+    await host.waitFor((m) => m.type === 'state' && m.extensions.device.hciPhase === 'capturing', 'hci capturing');
+    const request = daemon.requests.find((item) => item.command === 'startCapture');
+    assert.ok(request, 'worker sent startCapture to the daemon');
+    assert.equal(request.protocol, 'vokie.appleTvRemote.hci');
+    assert.equal(request.requiredVersion, '2');
+
+    // 确认键 → send_enter，返回键 → undo_last_output；松开不产生命令。
+    daemon.sendNhdr(nhdrSelectDown());
+    const enter = await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'send_enter from hci');
+    assert.ok(enter.requestId);
+    daemon.sendNhdr(nhdrBackDown());
+    await host.waitFor((m) => m.type === 'command' && m.command === 'undo_last_output', 'undo_last_output from hci');
+    daemon.sendNhdr(nhdrButtonUp());
+    await delay(150);
+    assert.equal(host.messages.filter((m) => m.type === 'command').length, 2);
+
+    const state = host.messages.filter((m) => m.type === 'state').at(-1);
+    assert.equal(state.extensions.device.hidAvailable, true);
+    assert.equal(state.extensions.device.hidSource, 'hci 抓包');
+    assert.equal(state.extensions.device.hciButtonCount, 4); // down×2 + up×2 edges
+
+    // Stop releases the privileged capture.
+    host.sendJson({ type: 'stop' });
+    await host.waitFor((m) => m.type === 'stopped', 'stopped');
+    await delay(150);
+    assert.equal(daemon.capturing, false);
+    assert.equal(daemon.sockets.length, 0);
+
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    await exited;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto mode: the HCI daemon serves buttons and the IOKit helper stays off', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-auto-'));
+  const daemon = new FakeHciDaemon();
+  await daemon.listen(join(dir, 'hci.sock'));
+  const host = new FakePluginHost();
+  let child;
+  try {
+    await host.listen();
+    // The IOKit helper is deliberately missing: with HCI capturing, the
+    // fallback must never be spawned.
+    child = await startWorker(host, {
+      VOKIE_HCI_SOCKET: join(dir, 'hci.sock'),
+      VOKIE_HID_HELPER: '/nonexistent/test-hid-helper'
+    });
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'hci-auto' });
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+    await host.waitFor((m) => m.type === 'state' && m.extensions.device.hciPhase === 'capturing', 'hci capturing');
+
+    daemon.sendNhdr(nhdrSelectDown());
+    await host.waitFor((m) => m.type === 'command' && m.command === 'send_enter', 'send_enter in auto');
+    const state = host.messages.filter((m) => m.type === 'state').at(-1);
+    assert.equal(state.extensions.device.hidSource, 'hci 抓包');
+    assert.equal(state.extensions.device.hidError, null);
+
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    await exited;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('auto mode: missing HCI daemon falls back to the IOKit helper', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-fallback-'));
+  const host = new FakePluginHost();
+  let child;
+  try {
+    await host.listen();
+    // Both the daemon socket and a real helper are unavailable: auto must
+    // report the definitive HCI failure and fall back to the (missing)
+    // helper without crashing or retrying forever.
+    child = await startWorker(host, {
+      VOKIE_HCI_SOCKET: '/nonexistent/test-hci.sock',
+      VOKIE_HID_HELPER: '/nonexistent/test-hid-helper'
+    });
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'hci-fallback' });
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+    const fallback = await host.waitFor(
+      (m) => m.type === 'state' && /回退 IOKit 助手/.test(m.extensions.device.hidError ?? ''),
+      'fallback state'
+    );
+    assert.equal(fallback.extensions.device.hciPhase, 'stopped');
+    assert.equal(fallback.extensions.device.hidAvailable, false);
+
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    await exited;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

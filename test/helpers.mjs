@@ -1,8 +1,10 @@
 // Shared test helpers: a manual clock for timer-driven modules, a minimal
-// RFC 6455 "Vokie Host" WebSocket server (text + binary frames), and ATVV
-// byte builders for a fake Chromecast Voice Remote.
+// RFC 6455 "Vokie Host" WebSocket server (text + binary frames), ATVV
+// byte builders for a fake Chromecast Voice Remote, and a fake privileged
+// HCI capture daemon with PacketLogger nhdr line builders.
 
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { createHash } from 'node:crypto';
 
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -269,4 +271,134 @@ export function v04Frame({ sequence = 0, predictor = 0, stepIndex = 0, nibbles =
 /** HID input report with report ID 0x01 prefix. */
 export function hidReport(usage) {
   return Uint8Array.of(0x01, usage);
+}
+
+// ---------------------------------------------------------------------------
+// Fake privileged HCI capture daemon (protocol `vokie.appleTvRemote.hci` v2)
+// and PacketLogger nhdr line builders, mirroring the real root daemon
+// (/var/run/com.vokie.hci.sock) used for button capture on macOS 26.5.
+
+/**
+ * Build one PacketLogger nhdr line carrying an ATT Handle-Value Notification
+ * inside an ACL packet, like `packetlogger convert -s -f nhdr` prints them:
+ * `<month> <day> <time> <device name> <0xconn-handle> RECV <hex bytes…>`.
+ */
+export function nhdrAttLine({
+  device = 'Chromecast Remote',
+  connHandle = 0x000c,
+  gattHandle,
+  value,
+  direction = 'RECV'
+} = {}) {
+  const l2cap = [0x1b, gattHandle & 0xff, (gattHandle >> 8) & 0xff, ...value];
+  const bytes = [
+    connHandle & 0xff, ((connHandle | 0x2000) >> 8) & 0xff, // PB flag = 2
+    l2cap.length & 0xff, 0x00, // ACL data length (not read by the parser)
+    l2cap.length & 0xff, (l2cap.length >> 8) & 0xff, // L2CAP length
+    0x04, 0x00, // ATT CID
+    ...l2cap
+  ];
+  const hex = bytes.map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
+  return `Sep 13 12:00:00.123456 ${device} 0x${connHandle.toString(16).padStart(4, '0')} ${direction} ${hex}`;
+}
+
+export const HCI_BUTTON_GATT_HANDLE = 0x002b;
+export function nhdrSelectDown() {
+  return nhdrAttLine({ gattHandle: HCI_BUTTON_GATT_HANDLE, value: [0x41, 0x00] });
+}
+export function nhdrBackDown() {
+  return nhdrAttLine({ gattHandle: HCI_BUTTON_GATT_HANDLE, value: [0x24, 0x02] });
+}
+export function nhdrButtonUp() {
+  return nhdrAttLine({ gattHandle: HCI_BUTTON_GATT_HANDLE, value: [0x00, 0x00] });
+}
+
+export class FakeHciDaemon {
+  constructor({ version = '2', captureAllowed = true, unavailableMessage = 'another capture is active' } = {}) {
+    this.version = version;
+    this.captureAllowed = captureAllowed;
+    this.unavailableMessage = unavailableMessage;
+    this.requests = [];
+    this.sockets = [];
+    this.capturing = false;
+    this.server = createNetServer((socket) => this.#accept(socket));
+  }
+
+  listen(path) {
+    return new Promise((resolve, reject) => {
+      this.server.once('error', reject);
+      this.server.listen(path, () => resolve());
+    });
+  }
+
+  async close() {
+    for (const socket of this.sockets.splice(0)) socket.destroy();
+    await new Promise((resolve) => this.server.close(() => resolve()));
+  }
+
+  sendNhdr(line) {
+    this.#send({ type: 'nhdr', captureId: 'fake', line });
+  }
+
+  stopCapture() {
+    this.capturing = false;
+    this.#send({ type: 'captureStopped', captureId: 'fake' });
+  }
+
+  #accept(socket) {
+    this.sockets.push(socket);
+    socket.setEncoding('utf8');
+    // Mirror the real daemon: the capture is owned by its client connection
+    // and stops when that connection drops.
+    socket.on('close', () => {
+      this.sockets = this.sockets.filter((item) => item !== socket);
+      this.capturing = false;
+    });
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (line) this.#handleRequest(line, socket);
+      }
+    });
+  }
+
+  #handleRequest(line, socket) {
+    let request;
+    try {
+      request = JSON.parse(line);
+    } catch {
+      return;
+    }
+    this.requests.push(request);
+    switch (request.command) {
+      case 'startCapture':
+        if (!this.captureAllowed) {
+          this.capturing = false;
+          socket.write(JSON.stringify({ type: 'captureUnavailable', message: this.unavailableMessage, id: request.id }) + '\n');
+          return;
+        }
+        this.capturing = true;
+        socket.write(JSON.stringify({ type: 'captureStarted', captureId: request.captureId, id: request.id }) + '\n');
+        return;
+      case 'stopCapture':
+        this.capturing = false;
+        socket.write(JSON.stringify({ type: 'captureStopped', captureId: request.captureId, id: request.id }) + '\n');
+        return;
+      case 'health':
+      case 'version':
+        socket.write(JSON.stringify({ type: 'ready', version: this.version, id: request.id }) + '\n');
+        return;
+      default:
+        socket.write(JSON.stringify({ type: 'error', message: 'unknown command', id: request.id }) + '\n');
+    }
+  }
+
+  #send(object) {
+    const payload = JSON.stringify(object) + '\n';
+    for (const socket of this.sockets) socket.write(payload);
+  }
 }

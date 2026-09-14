@@ -13,7 +13,9 @@
 // The BLE link itself goes through the Host's versioned GATT adapter
 // (ble_scan/ble_connect/ble_start_notify/ble_write, apiVersion "1"); the
 // worker owns the ATVV vendor protocol, gesture semantics, ADPCM decoding,
-// and 16 kHz PCM framing.
+// and 16 kHz PCM framing. Buttons come from either the privileged HCI capture
+// daemon (preferred; macOS 26.5 blocks every directly reachable HID path),
+// the bundled IOKit helper, or an explicit GATT HID subscription.
 
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +30,7 @@ import { HidButtonParser } from './hid-reports.mjs';
 import { DeviceSession, DEFAULT_CONFIG } from './device-session.mjs';
 import { HostSession } from './host-session.mjs';
 import { HidHelperSource } from './hid-helper-source.mjs';
+import { HciButtonSource } from './hci-button-source.mjs';
 
 // Echo of vokie.plugin.json. The Host deep-compares id/name/version/apiVersion/
 // platforms/transports/capabilities/permissions (plus normalized icon and
@@ -37,7 +40,7 @@ const manifest = {
   id: 'eb5f9200-de02-49bf-b602-57c49ebf78b9',
   name: 'Chromecast Voice Remote',
   device: { type: 'Chromecast Voice Remote', model: 'Google 18D1:9450' },
-  version: '0.2.6',
+  version: '0.3.0',
   apiVersion: '1',
   platforms: ['darwin'],
   transports: ['ble', 'hid'],
@@ -67,7 +70,13 @@ if (!wsUrl || !token) {
 const helperPath =
   process.env.VOKIE_HID_HELPER || fileURLToPath(new URL('../assets/chromecast-hid-helper', import.meta.url));
 
-console.error(`[cast-plugin] id=${manifest.id} version=${manifest.version} worker=${fileURLToPath(import.meta.url)} helper=${helperPath}`);
+// Privileged HCI capture daemon socket (installed by the Vokie device lab).
+// The env override is for tests and diagnostics; pointing it at a missing
+// path makes the source fail definitively, which is what tests rely on.
+const hciSocketPath =
+  process.env.VOKIE_HCI_SOCKET || '/var/run/com.vokie.hci.sock';
+
+console.error(`[cast-plugin] id=${manifest.id} version=${manifest.version} worker=${fileURLToPath(import.meta.url)} helper=${helperPath} hciSocket=${hciSocketPath}`);
 
 let socket;
 let started = false;
@@ -88,7 +97,11 @@ function sendBinary(buffer) {
 
 const extensionState = {
   package: { id: manifest.id, version: manifest.version },
-  device: { connected: false, name: null, atvvVersion: null, codec: null, sampleRate: null, hidAvailable: false, hidSource: null, hidError: null },
+  device: {
+    connected: false, name: null, atvvVersion: null, codec: null, sampleRate: null,
+    hidAvailable: false, hidSource: null, hidError: null,
+    hciPhase: null, hciError: null, hciButtonCount: 0
+  },
   bluetooth: { phase: 'idle', cause: null, retryInMs: null },
   session: { mode: null, phase: 'idle', accepted: false, lastEndCause: null, lastEndAt: null },
   settings: {
@@ -239,6 +252,86 @@ const hidHelper = new HidHelperSource({
 });
 
 // ---------------------------------------------------------------------------
+// Button sources. `auto` prefers the HCI capture daemon (the only button path
+// that works on macOS 26.5; see spec/hid-macos-limitations.md) and falls back
+// to the IOKit helper only after a definitive HCI failure (daemon missing,
+// version mismatch, PacketLogger missing). Contention ("another capture is
+// active") is not definitive: the HCI source keeps retrying and no second
+// button source is started, so one physical press can never fire twice.
+
+let hciDefinitivelyUnavailable = false;
+
+function hciWanted() {
+  return config.hidSource === 'hci' || (config.hidSource === 'auto' && !hciDefinitivelyUnavailable);
+}
+
+function iokitWanted() {
+  return config.hidSource === 'iohid' || (config.hidSource === 'auto' && hciDefinitivelyUnavailable);
+}
+
+function syncButtonSources() {
+  if (!started) return;
+  if (hciWanted() && !hciSource.started) hciSource.start();
+  if (!hciWanted() && hciSource.started) hciSource.stop();
+  if (iokitWanted() && !hidHelper.running) void hidHelper.start();
+  if (!iokitWanted() && hidHelper.running) hidHelper.stop();
+}
+
+const hciSource = new HciButtonSource({
+  socketPath: hciSocketPath,
+  onEdge(edge) {
+    if (!started) return;
+    const count = (extensionState.device.hciButtonCount ?? 0) + 1;
+    if (!extensionState.device.hidAvailable || extensionState.device.hidSource !== 'hci 抓包') {
+      updateExtensions('device', { hidAvailable: true, hidSource: 'hci 抓包', hidError: null });
+    }
+    updateExtensions('device', { hciButtonCount: count });
+    if (count <= 5) console.error(`[cast-hci] button: ${JSON.stringify(edge)}`);
+    emitState(extensionState.device.connected ? 'connected' : 'starting');
+    deviceSession.hidEvent(edge);
+  },
+  onStatus(info) {
+    updateExtensions('device', { hciPhase: info.phase, hciError: info.error ?? null });
+    if (info.phase === 'capturing') {
+      // HCI owns the buttons now; make sure the IOKit helper is not also
+      // running (defensive — auto only starts it after HCI gave up).
+      if (hidHelper.running) hidHelper.stop();
+      updateExtensions('device', {
+        hidAvailable: true, hidSource: 'hci 抓包', hidError: null,
+        hidSeized: false, hidSeizeFallback: false, hidInputMonitoring: null,
+        hidRawReportCount: 0, hidLastRawReport: null
+      });
+    } else if (info.phase === 'retrying' && info.definitive && config.hidSource === 'auto') {
+      // Definitive failure: stop probing and let the IOKit helper own the
+      // buttons for the rest of this run.
+      hciDefinitivelyUnavailable = true;
+      updateExtensions('device', {
+        hidAvailable: false, hidSource: null,
+        hidError: `HCI 抓包不可用：${info.error ?? '未知原因'}；已回退 IOKit 助手`
+      });
+      hciSource.stop();
+      if (started) void hidHelper.start();
+    } else if (info.phase === 'stopped') {
+      if (hciDefinitivelyUnavailable && config.hidSource === 'auto') {
+        // Keep the fallback message; the helper's own status handler updates
+        // the remaining fields.
+      } else {
+        const viaGatt = config.hidSource === 'gatt' && transport.hidSubscribed === true;
+        const viaHelper = hidHelper.receiving;
+        updateExtensions('device', {
+          hidAvailable: viaGatt || viaHelper,
+          hidSource: viaGatt ? 'gatt' : viaHelper ? 'io-kit 助手' : null
+        });
+      }
+    } else if (config.hidSource === 'hci' || config.hidSource === 'auto') {
+      // Connecting / retrying (including contention): buttons wait for HCI.
+      updateExtensions('device', { hidAvailable: false, hidSource: null, hidError: info.error ?? '等待 HCI 抓包' });
+    }
+    emitState(extensionState.device.connected ? 'connected' : 'starting');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // BLE transport through the Host adapter.
 
 const transport = new BleTransport({
@@ -248,7 +341,8 @@ const transport = new BleTransport({
     deviceSession.deviceReady({ name, atvv, hidSubscribed });
     hidParser.reset();
     const viaGatt = config.hidSource === 'gatt' && hidSubscribed === true;
-    const viaHelper = !viaGatt && hidHelper.receiving;
+    const viaHci = !viaGatt && hciSource.active;
+    const viaHelper = !viaGatt && !viaHci && hidHelper.receiving;
     updateExtensions('device', {
       connected: true,
       bleDeviceId: deviceId,
@@ -256,10 +350,10 @@ const transport = new BleTransport({
       atvvVersion: atvv.version,
       codec: `ADPCM ${atvv.sampleRate / 1000} kHz`,
       sampleRate: atvv.sampleRate,
-      hidAvailable: viaGatt || viaHelper,
-      hidSource: viaGatt ? 'gatt' : config.hidSource !== 'gatt' ? 'io-kit 助手' : null
+      hidAvailable: viaGatt || viaHci || viaHelper,
+      hidSource: viaGatt ? 'gatt' : viaHci ? 'hci 抓包' : viaHelper ? 'io-kit 助手' : null
     });
-    if (viaGatt || viaHelper) updateExtensions('device', { hidError: null });
+    if (viaGatt || viaHci || viaHelper) updateExtensions('device', { hidError: null });
     updateExtensions('bluetooth', { phase: 'connected', cause: null, retryInMs: null });
     updateExtensions('session', { mode: null, phase: 'idle', gesture: null, accepted: false });
     emitState('connected');
@@ -278,8 +372,8 @@ const transport = new BleTransport({
     if (config.hidSource === 'gatt') hidParser.reset();
     updateExtensions('device', {
       connected: false, bleDeviceId: null,
-      hidAvailable: config.hidSource !== 'gatt' && hidHelper.receiving,
-      hidSource: config.hidSource !== 'gatt' ? 'io-kit 助手' : null
+      hidAvailable: config.hidSource !== 'gatt' && (hidHelper.receiving || hciSource.active),
+      hidSource: config.hidSource !== 'gatt' ? (hciSource.active ? 'hci 抓包' : 'io-kit 助手') : null
     });
     updateExtensions('bluetooth', { phase: 'scanning', cause: `设备断开：${reason}` });
     updateExtensions('session', { mode: null, phase: 'idle', gesture: null, accepted: false });
@@ -301,11 +395,12 @@ const transport = new BleTransport({
     const cause = info.cause ?? null;
     if (info.hidAvailable === false) {
       // Explicit GATT mode never silently switches to a native source.
+      const viaHci = hciSource.active;
       const viaHelper = hidHelper.receiving;
       updateExtensions('device', {
-        hidAvailable: viaHelper,
-        hidSource: viaHelper ? 'io-kit 助手' : null,
-        hidError: viaHelper ? null : (extensionState.device.hidError ?? info.hidError ?? 'HID 通知不可用')
+        hidAvailable: viaHci || viaHelper,
+        hidSource: viaHci ? 'hci 抓包' : viaHelper ? 'io-kit 助手' : null,
+        hidError: viaHci || viaHelper ? null : (extensionState.device.hidError ?? info.hidError ?? 'HID 通知不可用')
       });
     }
     if (info.selectedDeviceId !== undefined) {
@@ -350,8 +445,8 @@ function validateConfig(value) {
     next.voiceMode = value.voiceMode;
   }
   if (value.hidSource !== undefined) {
-    if (!['auto', 'gatt', 'iohid'].includes(value.hidSource)) {
-      return { error: 'hidSource 必须是 auto、gatt 或 iohid' };
+    if (!['auto', 'gatt', 'iohid', 'hci'].includes(value.hidSource)) {
+      return { error: 'hidSource 必须是 auto、gatt、iohid 或 hci' };
     }
     next.hidSource = value.hidSource;
   }
@@ -373,6 +468,7 @@ function cleanupForStop() {
   const hadSession = deviceSession.teardown(); // sends MIC_CLOSE when streaming
   if (hadSession) hostSession.end('plugin_stopped', { cancel: true });
   transport.stop();
+  hciSource.stop(); // releases the privileged capture (and its socket)
   hidHelper.stop();
   updateExtensions('device', { connected: false });
   updateExtensions('bluetooth', { phase: 'idle', cause: null, retryInMs: null });
@@ -392,7 +488,7 @@ function handleHostMessage(message) {
       updateExtensions('bluetooth', { phase: 'scanning', cause: 'started' });
       emitState('starting');
       transport.start();
-      if (config.hidSource !== 'gatt') void hidHelper.start();
+      syncButtonSources(); // HCI capture first, IOKit only as auto fallback
       return send({ type: 'ready' });
     }
 
@@ -429,12 +525,16 @@ function handleHostMessage(message) {
         updateExtensions('device', { connected: false, bleDeviceId: null, hidAvailable: false });
         transport.start(); // waits for the old backend link to finish releasing
       }
-      // Keep the helper aligned with the new settings.
-      if (config.hidSource === 'gatt') {
-        hidHelper.stop();
-      } else if (!hidHelper.running && started) {
-        void hidHelper.start();
-      } else if (started && hidHelper.running && config.hidSuppressNative !== previous.hidSuppressNative) {
+      // Returning to `auto` re-probes HCI: a definitive failure earlier in
+      // this run must not permanently disable the channel after the user
+      // explicitly re-selected it.
+      if (config.hidSource === 'auto' && previous.hidSource !== 'auto') {
+        hciDefinitivelyUnavailable = false;
+      }
+      // Keep the button sources aligned with the new settings (HCI capture
+      // start/stop reloads bluetoothd; the transport reconnects on its own).
+      syncButtonSources();
+      if (started && hidHelper.running && iokitWanted() && config.hidSuppressNative !== previous.hidSuppressNative) {
         hidHelper.stop(); // restart with the new seize/observe argument
         void hidHelper.start();
       }
@@ -490,10 +590,12 @@ socket.addEventListener('message', (event) => {
 });
 socket.addEventListener('close', () => {
   // The Host releases BLE ownership on socket close; just exit cleanly. The
-  // helper exits by itself on stdin EOF.
+  // helper exits by itself on stdin EOF; the HCI daemon stops the capture
+  // when its client connection drops.
   transport.stop();
   deviceSession.stop();
   hidHelper.stop();
+  hciSource.stop();
   setImmediate(() => process.exit(0));
 });
 socket.addEventListener('error', (error) => {

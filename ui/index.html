@@ -56,12 +56,13 @@
     <div class="row">
       <label for="hid-source">按键来源</label>
       <select id="hid-source">
-        <option value="auto">自动（原生助手按键）</option>
-        <option value="gatt">GATT（配对后可能不可用）</option>
+        <option value="auto">自动（优先 HCI 抓包，失败回退原生助手）</option>
+        <option value="hci">HCI 抓包（需 Vokie 特权组件）</option>
         <option value="iohid">仅 IOKit 助手</option>
+        <option value="gatt">GATT（配对后可能不可用）</option>
       </select>
     </div>
-    <p class="hint muted">语音通过蓝牙传输，按键默认由原生助手读取。切换 GATT 会重连并结束当前录音。</p>
+    <p class="hint muted">语音通过蓝牙传输。按键默认走 HCI 抓包（读取系统蓝牙报文中的按键通知，需要 Vokie「设备实验室」安装的特权 HCI 组件与 PacketLogger；开启/停止抓包会短暂重载蓝牙）。HCI 不可用时自动回退 IOKit 助手。切换 GATT 会重连并结束当前录音。</p>
     <div class="row">
       <label for="hid-seize">拦截原生按键</label>
       <input id="hid-seize" type="checkbox" checked />
@@ -72,6 +73,7 @@
   <section>
     <h2>按键</h2>
     <p class="keys muted"><kbd>语音键</kbd> 录音（按左侧所选模式） ｜ <kbd>返回键</kbd> 撤销上一次输出 ｜ <kbd>确认键</kbd> 发送（回车确认）</p>
+    <p class="hint muted">遥控器闲置几分钟后会休眠：长按任意键约 3 秒唤醒，唤醒后第一下按键会被消耗。若「已连接但按键无反应」，长按唤醒无效时取下电池约 5 秒装回即可恢复。</p>
   </section>
 
 <script src="../assets/vokie-plugin-sdk.js"></script>
@@ -110,8 +112,10 @@
     // HID can work independently of the voice/BLE connection.
     if (value !== 'stopped') {
       if (device.hidAvailable === true) {
-        let hid = `按键：${device.hidSource === 'gatt' ? 'GATT' : 'IOKit 助手'}`;
-        if (device.hidSeizeFallback) hid += '（旁听：原生按键未拦截）';
+        const src = { gatt: 'GATT', 'hci 抓包': 'HCI 抓包', 'io-kit 助手': 'IOKit 助手' }[device.hidSource] || device.hidSource;
+        let hid = `按键：${src}`;
+        if (device.hidSource === 'io-kit 助手' && device.hidSeizeFallback) hid += '（旁听：原生按键未拦截）';
+        if (device.hidSource === 'hci 抓包') parts.push(`HCI 抓包${device.hciPhase === 'capturing' ? '进行中' : ''}`);
         parts.push(hid);
       } else if (device.hidAvailable === false) {
         parts.push(`按键：不可用${device.hidError ? `（${device.hidError}）` : ''}`);
@@ -172,7 +176,7 @@
     applySetting({ voiceMode: event.target.value }, event.target.value === 'tap' ? '短按模式' : '长按模式');
   });
   el('hid-source').addEventListener('change', (event) => {
-    const label = { auto: '自动（原生助手按键）', gatt: 'GATT', iohid: '仅 IOKit 助手' }[event.target.value];
+    const label = { auto: '自动', gatt: 'GATT', iohid: '仅 IOKit 助手', hci: 'HCI 抓包' }[event.target.value];
     applySetting({ hidSource: event.target.value }, `按键来源（${label}）`);
   });
   el('hid-seize').addEventListener('change', (event) => {
