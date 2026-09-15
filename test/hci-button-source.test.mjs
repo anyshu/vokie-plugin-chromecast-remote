@@ -62,7 +62,7 @@ test('nhdr parsing: tolerates punctuation after hex tokens', () => {
   const full = nhdrAttLine({ gattHandle: 0x2b, value: [0x41, 0x00] });
   const tokens = full.split(' ');
   const recv = tokens.indexOf('RECV');
-  tokens[recv + 3] = '00,'; // trailing comma attached to a hex byte
+  tokens[recv + 2] += ','; // trailing comma attached to a hex byte
   tokens.push(':'); // stray punctuation token is skipped
   assert.deepEqual(parsePacketLoggerLine(tokens.join(' ')), { gattHandle: 0x2b, value: [0x41, 0x00] });
 });

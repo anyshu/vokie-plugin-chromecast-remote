@@ -22,10 +22,15 @@ precondition(chromecastButtonReport(reportID: 0, bytes: [1, 7]) == [1, 7])
 precondition(chromecastButtonReport(reportID: 0, bytes: [7]) == nil)
 precondition(chromecastButtonReport(reportID: 2, bytes: [1, 7]) == nil)
 precondition(chromecastButtonReport(reportID: 1, bytes: []) == nil)
+precondition(supportedIdentity(vendor: 0x18d1, product: 0x9450, page: 1, usage: 6))
+precondition(supportedIdentity(vendor: 0x18d1, product: 0x9450, page: 12, usage: 1))
+precondition(!supportedIdentity(vendor: 0x1234, product: 0x9450, page: 12, usage: 1))
+precondition(!supportedIdentity(vendor: 0x18d1, product: 0x1234, page: 12, usage: 1))
+precondition(!supportedIdentity(vendor: 0x18d1, product: 0x9450, page: 1, usage: 2))
 print("normalization passed")
 `);
     const executable = join(dir, 'report-test');
-    await exec('swiftc', [fileURLToPath(new URL('../native/HIDReport.swift', import.meta.url)), main, '-o', executable]);
+    await exec('swiftc', [fileURLToPath(new URL('../native/HIDReport.swift', import.meta.url)), fileURLToPath(new URL('../native/RemoteIdentity.swift', import.meta.url)), main, '-o', executable]);
     assert.match((await exec(executable)).stdout, /normalization passed/);
   } finally {
     await rm(dir, { recursive: true, force: true });

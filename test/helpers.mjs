@@ -293,7 +293,7 @@ export function nhdrAttLine({
   const l2cap = [0x1b, gattHandle & 0xff, (gattHandle >> 8) & 0xff, ...value];
   const bytes = [
     connHandle & 0xff, ((connHandle | 0x2000) >> 8) & 0xff, // PB flag = 2
-    l2cap.length & 0xff, 0x00, // ACL data length (not read by the parser)
+    (l2cap.length + 4) & 0xff, (l2cap.length + 4) >> 8, // ACL includes the L2CAP header
     l2cap.length & 0xff, (l2cap.length >> 8) & 0xff, // L2CAP length
     0x04, 0x00, // ATT CID
     ...l2cap

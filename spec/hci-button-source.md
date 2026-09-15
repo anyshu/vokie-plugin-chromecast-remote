@@ -2,6 +2,10 @@
 
 日期：2026-09-13。实现版本：0.3.0。前置诊断：[hid-macos-limitations.md](hid-macos-limitations.md)。
 
+## v0.4.0 更新（2026-09-15）
+
+新增 A0 / 26.2 的 `0x0029` 八字节按键报告、实际 HID 型号/固件、设备地址与序列号验证后的 HCI 句柄绑定。A0 只有绑定完成才显示按键可用；语音继续使用 Host BLE 的 ATVV UUID 通道。详细迁移与验证见 [a0-remote-support.md](a0-remote-support.md)。下文保留 v0.3.0 的旧款实现背景。
+
 ## 背景
 
 macOS 26.5 上插件进程可直达的按键读取路径全部不可用（IOKit 共享零报文、seize 被拒且 root 不豁免、事件系统 monitor / CGEventTap 零事件、GATT `2A4D` 被系统隐藏）。遥控器的确认/返回键是它在**发给系统 HID 栈那条连接**上的 ATT Handle-Value Notification（GATT 句柄 `0x002B`：`41 00` 确认按下、`24 02` 返回按下、`00 00` 松开），任何用户态 HID/GATT 查询都看不到——蓝牙 HCI 层是唯一观测点。

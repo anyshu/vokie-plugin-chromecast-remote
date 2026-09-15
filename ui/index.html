@@ -104,6 +104,8 @@
     const parts = [];
     if (device.connected) {
       parts.push(device.name || '已连接');
+      if (device.modelNumber) parts.push(`型号 ${device.modelNumber}`);
+      if (device.firmwareVersion) parts.push(`固件 ${device.firmwareVersion}`);
       if (device.codec) parts.push(`${device.codec} · ATVV ${device.atvvVersion || '?'}`);
     } else {
       parts.push(value === 'stopped' ? '插件未启动' : (phaseLabels[bt.phase] || bt.phase || '未连接'));
@@ -121,6 +123,10 @@
         parts.push(`按键：不可用${device.hidError ? `（${device.hidError}）` : ''}`);
         if (device.hidInputMonitoring === 'denied') parts.push('输入监控未授权');
       }
+    }
+    if (device.modelNumber === 'A0' && device.hciPhase === 'capturing') {
+      parts.push(device.hciIdentityVerified ? '设备身份已验证' : '等待设备身份验证');
+      if (device.identityError) parts.push(device.identityError);
     }
     el('meta-device').textContent = parts.join(' · ');
 

@@ -122,6 +122,17 @@ export class BleTransport {
   #releasing = null;
   #unreleasedDeviceId = null;
 
+  #preferredDeviceId = null;
+
+  setPreferredDeviceId(deviceId) {
+    const next = typeof deviceId === 'string' && deviceId.trim() ? deviceId : null;
+    if (this.#preferredDeviceId === next) return;
+    this.#preferredDeviceId = next;
+    if (this.started && this.deviceId && next && this.deviceId.toLowerCase() !== next.toLowerCase()) {
+      this.#dropDevice('HID 身份已更新，切换到对应遥控器');
+    }
+  }
+
   start() {
     if (this.started) return;
     this.started = true;
@@ -251,7 +262,8 @@ export class BleTransport {
     const devices = Array.isArray(message.devices) ? message.devices : [];
     const now = this.#clock.now();
     for (const [id, until] of this.#failedDeviceIds) if (until <= now) this.#failedDeviceIds.delete(id);
-    const candidate = pickChromecastCandidate(devices, this.#failedDeviceIds, now);
+    const candidate = pickChromecastCandidate(this.#preferredDeviceId ? devices.filter(device =>
+      typeof device?.deviceId === 'string' && device.deviceId.toLowerCase() === this.#preferredDeviceId.toLowerCase()) : devices, this.#failedDeviceIds, now);
     this.#onStatus({
       phase: 'scanning', candidateCount: devices.length,
       selectedDeviceId: candidate?.deviceId ?? null,

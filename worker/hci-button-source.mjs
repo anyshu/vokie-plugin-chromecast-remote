@@ -20,8 +20,10 @@
 //              "captureUnavailable"|"error", ...}
 //              {"type":"nhdr","captureId","line":"<PacketLogger nhdr line>"}
 //
-// Button values on handle 0x002B: `41 00` select down, `24 02` back down,
-// `00 00` release; other values (volume, d-pad, …) are ignored.
+// Legacy: handle 0x002B, two-byte select/back/release reports.
+// A0 / 26.2: handle 0x0029, eight-byte reports; serial-verified HCI identity
+// is required even when PacketLogger shows the expected name/address.
+// Profile and identity rules are ported from xiguashuo-pc 40ba1c2f.
 //
 // The daemon allows a single capture system-wide (the Apple TV Remote mic and
 // the app's own Google TV helper compete for the same slot): while another
@@ -35,6 +37,8 @@
 // connection drops, so simply closing the socket is a clean stop.
 
 import { createConnection } from 'node:net';
+import { buttonReport, remoteProfile, matchesHciSource } from './remote-profile.mjs';
+import { HciIdentity, parseTraceLine, attPacket } from './hci-identity.mjs';
 
 export const HCI_PROTOCOL = 'vokie.appleTvRemote.hci';
 export const HCI_REQUIRED_VERSION = '2';
@@ -43,20 +47,11 @@ export const DEFAULT_HCI_SOCKET_PATH = '/var/run/com.vokie.hci.sock';
 export const REMOTE_DEVICE_NAME = 'Chromecast Remote';
 export const BUTTON_GATT_HANDLE = 0x002b;
 
-const SELECT_DOWN_VALUE = Uint8Array.of(0x41, 0x00); // 确认键按下
-const BACK_DOWN_VALUE = Uint8Array.of(0x24, 0x02); // 返回键按下
-const BUTTON_UP_VALUE = Uint8Array.of(0x00, 0x00); // 松开
-
 const L2CAP_ATT_CID = 0x0004;
 const ATT_HANDLE_VALUE_NOTIFICATION = 0x1b;
 
 const CONNECT_TIMEOUT_MS = 800;
 const RETRY_MS = 5000;
-const MAX_IGNORED_DEBUG = 20;
-
-function valuesEqual(a, b) {
-  return a.length === b.length && a.every((byte, index) => byte === b[index]);
-}
 
 /**
  * Parse one PacketLogger nhdr line into an ATT Handle-Value Notification.
@@ -71,23 +66,9 @@ function valuesEqual(a, b) {
  * @returns {{gattHandle: number, value: number[]} | null}
  */
 export function parsePacketLoggerLine(line, deviceName = REMOTE_DEVICE_NAME) {
-  if (typeof line !== 'string' || !line) return null;
-  const tokens = line.split(/[ \t]+/).filter((token) => token.length > 0);
-  const recvIndex = tokens.findIndex((token) => token.toUpperCase() === 'RECV');
-  if (recvIndex < 5) return null;
-  const handleTokenIndex = recvIndex - 1;
-  const name = tokens.slice(3, handleTokenIndex).join(' ');
-  if (name.toLowerCase() !== deviceName.toLowerCase()) return null;
-
-  const bytes = [];
-  for (const token of tokens.slice(recvIndex + 1)) {
-    const cleaned = token.endsWith(',') || token.endsWith(':') ? token.slice(0, -1) : token;
-    if (cleaned.length !== 2) continue;
-    const value = Number.parseInt(cleaned, 16);
-    if (Number.isNaN(value)) continue;
-    bytes.push(value);
-  }
-  return parseAclBytes(bytes);
+  const trace = parseTraceLine(line);
+  if (!trace?.received || trace.source.toLowerCase() !== deviceName.toLowerCase()) return null;
+  return parseAclBytes(trace.bytes);
 }
 
 /**
@@ -100,7 +81,7 @@ export function parsePacketLoggerLine(line, deviceName = REMOTE_DEVICE_NAME) {
  * @returns {{gattHandle: number, value: number[]} | null}
  */
 export function parseAclBytes(bytes) {
-  if (!Array.isArray(bytes) || bytes.length < 11) return null;
+  if (!attPacket(bytes) || bytes.length < 11) return null;
   const handlePB = bytes[0] | (bytes[1] << 8);
   if (((handlePB >> 12) & 0x3) !== 2) return null;
   const l2capLength = bytes[4] | (bytes[5] << 8);
@@ -117,26 +98,26 @@ export function parseAclBytes(bytes) {
  * report parser), de-duplicating held keys and synthesizing releases.
  */
 export class HciButtonValueParser {
+  profile = 'legacy';
   #selectPressed = false;
   #backPressed = false;
-  #ignoredCount = 0;
 
   /** @returns {Array<{button: 'select'|'back', isDown: boolean}>} */
   feed({ gattHandle, value }) {
-    if (gattHandle !== BUTTON_GATT_HANDLE) return [];
-    if (!Array.isArray(value) || value.length !== 2) return [];
+    const report = buttonReport(this.profile, { gattHandle, value });
+    if (!report) return [];
 
-    if (valuesEqual(value, SELECT_DOWN_VALUE)) {
+    if (report === 'select') {
       if (this.#selectPressed) return [];
       this.#selectPressed = true;
       return [{ button: 'select', isDown: true }];
     }
-    if (valuesEqual(value, BACK_DOWN_VALUE)) {
+    if (report === 'back') {
       if (this.#backPressed) return [];
       this.#backPressed = true;
       return [{ button: 'back', isDown: true }];
     }
-    if (valuesEqual(value, BUTTON_UP_VALUE)) {
+    if (report === 'released') {
       const edges = [];
       if (this.#selectPressed) {
         this.#selectPressed = false;
@@ -148,18 +129,12 @@ export class HciButtonValueParser {
       }
       return edges;
     }
-    // Other physical keys (volume, d-pad, custom keys…): ignore; log bounded.
-    this.#ignoredCount += 1;
-    if (this.#ignoredCount <= MAX_IGNORED_DEBUG) {
-      console.error(`[cast-hci] ignored button value: ${value.map((byte) => byte.toString(16).padStart(2, '0')).join(' ')}`);
-    }
     return [];
   }
 
   reset() {
     this.#selectPressed = false;
     this.#backPressed = false;
-    this.#ignoredCount = 0;
   }
 }
 
@@ -184,7 +159,8 @@ export class HciButtonSource {
    *          error?: string|null, definitive?: boolean, retryInMs?: number|null}) => void} [options.onStatus]
    * @param {object} [options.clock] injectable {setTimer(fn, ms), clearTimer(handle)}
    */
-  constructor({ socketPath, onEdge, onStatus, clock } = {}) {
+  constructor({ socketPath, onEdge, onStatus, onIdentity, clock } = {}) {
+    this.#onIdentity = onIdentity;
     this.#socketPath = socketPath ?? DEFAULT_HCI_SOCKET_PATH;
     this.#onEdge = onEdge ?? (() => {});
     this.#onStatus = onStatus ?? (() => {});
@@ -193,6 +169,42 @@ export class HciButtonSource {
       clearTimer: (handle) => clearTimeout(handle)
     };
     this.#parser = new HciButtonValueParser();
+  }
+
+  #identity = new HciIdentity();
+  #device = null;
+  #onIdentity;
+
+  get buttonsReady() { return this.active && (this.#parser.profile !== 'a0' || this.#identity.connectionHandle !== null); }
+
+  setDevice(device) {
+    this.#device = device;
+    this.#parser.profile = remoteProfile(device?.modelNumber);
+    this.#parser.reset();
+    this.#resetIdentity();
+  }
+
+  identityMessage(message) {
+    if (!this.active || this.#parser.profile !== 'a0' || message.deviceId !== this.#device?.deviceId) return;
+    if (message.type === 'identity_probe') {
+      if (message.serialNumber !== this.#device?.serialNumber) return;
+      this.#identity.begin(message.serialNumber, Date.now());
+    } else if (message.type === 'identity_confirm') {
+      this.#identity.confirm(Buffer.from(message.data ?? '', 'base64'), Date.now());
+    } else if (message.type === 'identity_reset') {
+      this.#resetIdentity();
+    }
+    this.#notifyIdentity();
+  }
+
+  #resetIdentity() {
+    this.#identity.reset();
+    this.#notifyIdentity();
+  }
+
+  #notifyIdentity() {
+    this.#onIdentity?.({ verified: this.#identity.connectionHandle !== null,
+      required: this.#parser.profile === 'a0', connectionHandle: this.#identity.connectionHandle });
   }
 
   #socketPath;
@@ -271,6 +283,8 @@ export class HciButtonSource {
     this.#socket = null;
     this.#captureActive = false;
     this.#lineBuffer = '';
+    this.#parser.reset();
+    this.#resetIdentity();
     if (socket) {
       socket.removeAllListeners();
       socket.destroy();
@@ -373,6 +387,7 @@ export class HciButtonSource {
         if (this.#captureActive) return;
         this.#captureActive = true;
         this.#parser.reset();
+        this.#resetIdentity();
         this.#status({ phase: 'capturing', error: null });
         console.error(`[cast-hci] capture started (${this.#socketPath})`);
         return;
@@ -381,6 +396,7 @@ export class HciButtonSource {
         // the socket open, so ask for it again.
         this.#captureActive = false;
         this.#parser.reset();
+        this.#resetIdentity();
         this.#scheduleRetry('HCI 抓包被停止，重新请求');
         this.#sendRequest('startCapture');
         return;
@@ -402,7 +418,20 @@ export class HciButtonSource {
   }
 
   #processPacketLoggerLine(line) {
-    const notification = parsePacketLoggerLine(line);
+    const trace = parseTraceLine(line);
+    if (!trace) return;
+    const known = matchesHciSource(trace.source, this.#device?.deviceAddress);
+    if (this.#parser.profile === 'a0') {
+      if (!known && trace.source !== '00:00:00:00:00:00') return;
+      const previous = this.#identity.connectionHandle;
+      this.#identity.observe(trace.bytes, trace.received, Date.now());
+      if (previous !== this.#identity.connectionHandle) {
+        this.#parser.reset();
+        this.#notifyIdentity();
+      }
+      if (!trace.received || !this.#identity.accepts(trace.bytes)) return;
+    } else if (!trace.received || !known) return;
+    const notification = parseAclBytes(trace.bytes);
     if (!notification) return;
     for (const edge of this.#parser.feed(notification)) {
       try {

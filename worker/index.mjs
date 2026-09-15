@@ -30,6 +30,8 @@ import { HidButtonParser } from './hid-reports.mjs';
 import { DeviceSession, DEFAULT_CONFIG } from './device-session.mjs';
 import { HostSession } from './host-session.mjs';
 import { HidHelperSource } from './hid-helper-source.mjs';
+import { remoteProfile } from './remote-profile.mjs';
+import { RemoteIdentitySource } from './remote-identity-source.mjs';
 import { HciButtonSource } from './hci-button-source.mjs';
 
 // Echo of vokie.plugin.json. The Host deep-compares id/name/version/apiVersion/
@@ -40,7 +42,7 @@ const manifest = {
   id: 'eb5f9200-de02-49bf-b602-57c49ebf78b9',
   name: 'Chromecast Voice Remote',
   device: { type: 'Chromecast Voice Remote', model: 'Google 18D1:9450' },
-  version: '0.3.0',
+  version: '0.4.0',
   apiVersion: '1',
   platforms: ['darwin'],
   transports: ['ble', 'hid'],
@@ -279,6 +281,15 @@ function syncButtonSources() {
 
 const hciSource = new HciButtonSource({
   socketPath: hciSocketPath,
+  onIdentity(info) {
+    identitySource.setVerified(info.verified);
+    updateExtensions('device', { hciIdentityVerified: info.verified, hciConnectionHandle: info.connectionHandle });
+    if (hciSource.active && hciWanted()) {
+      updateExtensions('device', { hidAvailable: hciSource.buttonsReady, hidSource: 'hci 抓包',
+        hidError: hciSource.buttonsReady ? null : '等待 A0 设备身份验证' });
+      emitState(extensionState.device.connected ? 'connected' : 'starting');
+    }
+  },
   onEdge(edge) {
     if (!started) return;
     const count = (extensionState.device.hciButtonCount ?? 0) + 1;
@@ -291,13 +302,15 @@ const hciSource = new HciButtonSource({
     deviceSession.hidEvent(edge);
   },
   onStatus(info) {
+    identitySource.setCapture(info.phase === 'capturing');
     updateExtensions('device', { hciPhase: info.phase, hciError: info.error ?? null });
     if (info.phase === 'capturing') {
       // HCI owns the buttons now; make sure the IOKit helper is not also
       // running (defensive — auto only starts it after HCI gave up).
       if (hidHelper.running) hidHelper.stop();
       updateExtensions('device', {
-        hidAvailable: true, hidSource: 'hci 抓包', hidError: null,
+        hidAvailable: hciSource.buttonsReady, hidSource: 'hci 抓包',
+        hidError: hciSource.buttonsReady ? null : '等待 A0 设备身份验证',
         hidSeized: false, hidSeizeFallback: false, hidInputMonitoring: null,
         hidRawReportCount: 0, hidLastRawReport: null
       });
@@ -331,6 +344,29 @@ const hciSource = new HciButtonSource({
   }
 });
 
+const identitySource = new RemoteIdentitySource({
+  helperPath: process.env.VOKIE_IDENTITY_HELPER || helperPath,
+  onDevice(device) {
+    // Retain the known profile on helper failure/removal: an A0 must never
+    // silently become a legacy device accepting unverified same-name packets.
+    hciSource.setDevice(device ?? { modelNumber: extensionState.device.modelNumber });
+    if (device?.deviceId) transport.setPreferredDeviceId(device.deviceId);
+    hidParser.profile = remoteProfile(device?.modelNumber ?? extensionState.device.modelNumber);
+    hidParser.reset();
+    updateExtensions('device', {
+      modelNumber: device?.modelNumber ?? extensionState.device.modelNumber ?? null,
+      firmwareVersion: device?.firmwareVersion ?? null,
+      identityConnected: Boolean(device), identityError: null
+    });
+    emitState(extensionState.device.connected ? 'connected' : 'starting');
+  },
+  onMessage(message) { hciSource.identityMessage(message); },
+  onError(error) {
+    updateExtensions('device', { identityError: error });
+    emitState(extensionState.device.connected ? 'connected' : 'starting');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // BLE transport through the Host adapter.
 
@@ -341,7 +377,7 @@ const transport = new BleTransport({
     deviceSession.deviceReady({ name, atvv, hidSubscribed });
     hidParser.reset();
     const viaGatt = config.hidSource === 'gatt' && hidSubscribed === true;
-    const viaHci = !viaGatt && hciSource.active;
+    const viaHci = !viaGatt && hciSource.buttonsReady;
     const viaHelper = !viaGatt && !viaHci && hidHelper.receiving;
     updateExtensions('device', {
       connected: true,
@@ -372,8 +408,8 @@ const transport = new BleTransport({
     if (config.hidSource === 'gatt') hidParser.reset();
     updateExtensions('device', {
       connected: false, bleDeviceId: null,
-      hidAvailable: config.hidSource !== 'gatt' && (hidHelper.receiving || hciSource.active),
-      hidSource: config.hidSource !== 'gatt' ? (hciSource.active ? 'hci 抓包' : 'io-kit 助手') : null
+      hidAvailable: config.hidSource !== 'gatt' && (hidHelper.receiving || hciSource.buttonsReady),
+      hidSource: config.hidSource !== 'gatt' ? (hciSource.buttonsReady ? 'hci 抓包' : 'io-kit 助手') : null
     });
     updateExtensions('bluetooth', { phase: 'scanning', cause: `设备断开：${reason}` });
     updateExtensions('session', { mode: null, phase: 'idle', gesture: null, accepted: false });
@@ -395,7 +431,7 @@ const transport = new BleTransport({
     const cause = info.cause ?? null;
     if (info.hidAvailable === false) {
       // Explicit GATT mode never silently switches to a native source.
-      const viaHci = hciSource.active;
+      const viaHci = hciSource.buttonsReady;
       const viaHelper = hidHelper.receiving;
       updateExtensions('device', {
         hidAvailable: viaHci || viaHelper,
@@ -470,6 +506,7 @@ function cleanupForStop() {
   transport.stop();
   hciSource.stop(); // releases the privileged capture (and its socket)
   hidHelper.stop();
+  identitySource.stop();
   updateExtensions('device', { connected: false });
   updateExtensions('bluetooth', { phase: 'idle', cause: null, retryInMs: null });
   updateExtensions('session', { mode: null, phase: 'idle', gesture: null, accepted: false });
@@ -487,6 +524,7 @@ function handleHostMessage(message) {
       started = true;
       updateExtensions('bluetooth', { phase: 'scanning', cause: 'started' });
       emitState('starting');
+      void identitySource.start();
       transport.start();
       syncButtonSources(); // HCI capture first, IOKit only as auto fallback
       return send({ type: 'ready' });
@@ -596,6 +634,7 @@ socket.addEventListener('close', () => {
   deviceSession.stop();
   hidHelper.stop();
   hciSource.stop();
+  identitySource.stop();
   setImmediate(() => process.exit(0));
 });
 socket.addEventListener('error', (error) => {

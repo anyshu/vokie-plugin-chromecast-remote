@@ -250,3 +250,28 @@ for (const [reason, message] of [
     assert.equal(f.sent.filter((m) => m.type === 'ble_scan').length, 1);
   });
 }
+
+test('HID peripheral UUID selects the matching Chromecast among same-name devices', () => {
+  const f = fixture();
+  f.transport.setPreferredDeviceId('A0-UUID');
+  f.transport.start();
+  f.scanResult([{ ...cast, deviceId: 'old-uuid' }, { ...cast, deviceId: 'a0-uuid' }]);
+  assert.equal(f.last('ble_connect').deviceId, 'a0-uuid');
+  f.transport.stop();
+});
+
+test('late HID identity releases a wrong BLE candidate before switching and rejects its notifications', async () => {
+  const f = fixture();
+  f.transport.start();
+  f.scanResult([cast]);
+  f.transport.setPreferredDeviceId('A0-UUID');
+  assert.equal(f.last('ble_disconnect').deviceId, cast.deviceId);
+  assert.equal(f.transport.deviceId, null);
+  await f.ack('ble_connect'); // stale native connect completion
+  assert.equal(f.last('ble_start_notify'), undefined);
+  await f.ack('ble_disconnect');
+  f.clock.advance(1000);
+  f.scanResult([cast, { ...cast, deviceId: 'a0-uuid' }]);
+  assert.equal(f.last('ble_connect').deviceId, 'a0-uuid');
+  f.transport.stop();
+});

@@ -6,6 +6,8 @@
 // so a key-up is synthesized whenever the usage changes or a zero arrives.
 // Usage codes follow vRemoter's RemoteProfiles.chromecastButtons table.
 
+import { buttonReport } from './remote-profile.mjs';
+
 export const HID_INPUT_REPORT_ID = 0x01;
 
 export const CHROMECAST_BUTTONS = {
@@ -31,6 +33,7 @@ export const CHROMECAST_BUTTONS = {
  * BLE retransmits cannot double-fire a button.
  */
 export class HidButtonParser {
+  profile = 'legacy';
   #lastUsage = null;
 
   /**
@@ -41,9 +44,17 @@ export class HidButtonParser {
    */
   feed(bytes) {
     if (!bytes.length) return [];
-    if (bytes[0] !== HID_INPUT_REPORT_ID) return [];
-    const payload = bytes.length > 1 ? bytes.subarray(1) : bytes;
-    const usage = payload[0];
+    let usage;
+    if (this.profile === 'a0') {
+      const payload = bytes.length === 9 && bytes[0] === HID_INPUT_REPORT_ID ? bytes.subarray(1) : bytes;
+      const report = buttonReport('a0', { gattHandle: 0x29, value: [...payload] });
+      if (!report) return [];
+      usage = { select: 7, back: 11, released: 0 }[report];
+    } else {
+      if (bytes[0] !== HID_INPUT_REPORT_ID) return [];
+      const payload = bytes.length > 1 ? bytes.subarray(1) : bytes;
+      usage = payload[0];
+    }
     const events = [];
 
     if (usage === 0) {

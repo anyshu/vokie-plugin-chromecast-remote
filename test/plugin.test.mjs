@@ -53,6 +53,7 @@ async function startWorker(host, extraEnv = {}) {
       // or reach the real privileged HCI daemon (a capture start would reload
       // the machine's bluetoothd).
       VOKIE_HID_HELPER: '/nonexistent/test-hid-helper',
+      VOKIE_IDENTITY_HELPER: '/nonexistent/test-identity-helper',
       VOKIE_HCI_SOCKET: '/nonexistent/test-hci.sock',
       ...extraEnv
     },
@@ -582,6 +583,100 @@ setInterval(() => {
   } finally {
     child?.kill('SIGKILL');
     await host.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('A0 worker: serial-bound HCI buttons, 160-byte ATVV audio and identity cleanup', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'a0-plugin-'));
+  const daemon = new FakeHciDaemon();
+  const host = new FakePluginHost();
+  let child;
+  try {
+    const events = join(dir, 'identity.jsonl');
+    const commands = join(dir, 'commands.jsonl');
+    const helper = join(dir, 'identity.mjs');
+    await writeFile(events, '');
+    await writeFile(commands, '');
+    await writeFile(helper, `#!/usr/bin/env node
+import { readFileSync, appendFileSync } from 'node:fs';
+let cursor = 0;
+console.log(JSON.stringify({ type: 'identity_ready' }));
+process.stdin.on('data', data => appendFileSync(${JSON.stringify(commands)}, data));
+process.stdin.on('end', () => process.exit(0));
+setInterval(() => {
+  const text = readFileSync(${JSON.stringify(events)}, 'utf8');
+  const end = text.lastIndexOf('\\n') + 1;
+  if (end > cursor) { process.stdout.write(text.slice(cursor, end)); cursor = end; }
+}, 10);
+`);
+    await chmod(helper, 0o755);
+    await daemon.listen(join(dir, 'hci.sock'));
+    await host.listen();
+    child = await startWorker(host, { VOKIE_HCI_SOCKET: join(dir, 'hci.sock'), VOKIE_IDENTITY_HELPER: helper });
+    await host.waitFor(m => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'start' });
+    await host.waitFor(m => m.type === 'ready', 'ready');
+    await host.waitFor(m => m.type === 'state' && m.extensions.device.hciPhase === 'capturing', 'capture');
+    const emitIdentity = message => appendFile(events, JSON.stringify({ deviceId: DEVICE_ID, ...message }) + '\n');
+    await emitIdentity({ type: 'identity', connected: true, modelNumber: 'A0', firmwareVersion: '26.2',
+      serialNumber: 'A0SERIAL1234', deviceAddress: '47-54-51-45-a5-a8' });
+    await host.waitFor(m => m.type === 'state' && m.extensions.device.modelNumber === 'A0', 'A0 model');
+    await connectRemote(host, false);
+    const state = host.messages.filter(m => m.type === 'state').at(-1).extensions.device;
+    assert.equal(state.firmwareVersion, '26.2');
+    assert.equal(state.hidAvailable, false);
+    // All A0 source forms still require a verified connection handle.
+    function trace(value, { direction = 'RECV', handle = 12, source = '00:00:00:00:00:00' } = {}) {
+      const bytes = [handle, direction === 'SEND' ? 0 : 0x20, value.length + 4, 0, value.length, 0, 4, 0, ...value];
+      return `Sep 15 12:00:00 ${source} 0x000c ${direction} ${bytes.map(b => b.toString(16).padStart(2, '0')).join(' ')}`;
+    }
+    const select = [0x1b, 0x29, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+    const up = [0x1b, 0x29, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    daemon.sendNhdr(trace(select));
+    daemon.sendNhdr(trace(select, { source: 'Chromecast Remote' }));
+    await delay(50);
+    assert.equal(host.messages.filter(m => m.type === 'command').length, 0);
+    await emitIdentity({ type: 'identity_probe', serialNumber: 'A0SERIAL1234' });
+    await delay(50);
+    daemon.sendNhdr(trace([0x0a, 0x10, 0], { direction: 'SEND' }));
+    daemon.sendNhdr(trace([0x0b, ...Buffer.from('A0SERIAL1234')]));
+    await emitIdentity({ type: 'identity_confirm', data: Buffer.from('A0SERIAL1234').toString('base64') });
+    await host.waitFor(m => m.type === 'state' && m.extensions.device.hciIdentityVerified, 'verified A0');
+    daemon.sendNhdr(trace(select, { handle: 13 }));
+    daemon.sendNhdr(trace(select, { source: '00:11:22:33:44:55' }));
+    daemon.sendNhdr(trace(select));
+    daemon.sendNhdr(trace(select));
+    daemon.sendNhdr(trace(up));
+    daemon.sendNhdr(trace([0x1b, 0x29, 0, 11, 0, 0, 0, 0, 0, 0, 0], { source: '47:54:51:45:A5:A8' }));
+    await host.waitFor(m => m.type === 'command' && m.command === 'undo_last_output', 'A0 back');
+    assert.deepEqual(host.messages.filter(m => m.type === 'command').map(m => m.command), ['send_enter', 'undo_last_output']);
+
+    notification(host, ATVV.control, audioStartPhysical({ streamId: 0xa4 }));
+    notification(host, ATVV.audio, new Uint8Array(160).fill(0x77));
+    const session = await host.waitFor(m => m.type === 'session_start', 'A0 PTT');
+    assert.equal(host.binaryFrames.length, 0);
+    host.sendJson({ type: 'session_accepted', requestId: session.requestId, sessionId: 'a0', mode: 'ptt' });
+    const audio = await host.waitFor(m => m.type === 'audio_frame', 'A0 audio');
+    assert.equal(audio.pcm.length, 640); // 160 ADPCM bytes -> 320 PCM16 samples
+    notification(host, ATVV.control, audioStopPhysical());
+    await host.waitFor(m => m.type === 'session_stop', 'A0 release');
+
+    // Device loss invalidates the binding and held-key state immediately.
+    await emitIdentity({ type: 'identity', connected: false });
+    await host.waitFor(m => m.type === 'state' && m.extensions.device.identityConnected === false, 'identity removed');
+    daemon.sendNhdr(trace(select));
+    await delay(50);
+    assert.equal(host.messages.filter(m => m.type === 'command').length, 2);
+    assert.match(await readFile(commands, 'utf8'), /"verified":true/);
+    const exit = new Promise(resolve => child.once('exit', resolve));
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor(m => m.type === 'destroyed', 'destroyed');
+    await exit;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
+    await daemon.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -78,6 +78,12 @@ export class HidHelperSource {
     return this.running && this.#receiving;
   }
 
+  send(message) {
+    if (!this.running || this.#child.stdin.destroyed) return false;
+    this.#child.stdin.write(JSON.stringify(message) + '\n');
+    return true;
+  }
+
   async start() {
     if (!this.#stopped || this.#child) return;
     this.#stopped = false;
@@ -111,6 +117,7 @@ export class HidHelperSource {
 
     const child = spawn(this.#helperPath, this.#buildArgs(), { stdio: ['pipe', 'pipe', 'pipe'] });
     this.#child = child;
+    child.stdin.on('error', () => {});
     this.#lineBuffer = '';
     this.#receiving = false;
 

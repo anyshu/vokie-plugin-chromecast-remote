@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p assets
-swiftc -O -o assets/chromecast-hid-helper native/chromecast-hid-helper.swift native/HidBridge.swift native/HIDDiagnostics.swift native/HIDReport.swift
+swiftc -O -o assets/chromecast-hid-helper native/chromecast-hid-helper.swift native/HidBridge.swift native/HIDDiagnostics.swift native/HIDReport.swift native/RemoteIdentity.swift native/IdentityBridge.swift -framework CoreBluetooth
 chmod +x assets/chromecast-hid-helper
 echo "built assets/chromecast-hid-helper"
 # Verify the executable without opening devices or triggering permission UI.
