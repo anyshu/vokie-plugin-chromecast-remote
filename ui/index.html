@@ -56,17 +56,17 @@
     <div class="row">
       <label for="hid-source">按键来源</label>
       <select id="hid-source">
-        <option value="auto">自动（优先 HCI 抓包，失败回退原生助手）</option>
-        <option value="hci">HCI 抓包（需 Vokie 特权组件）</option>
+        <option value="auto">自动（优先 HCI v4 抓包，失败回退原生助手）</option>
+        <option value="hci">HCI v4 抓包（需 Vokie 特权组件）</option>
         <option value="iohid">仅 IOKit 助手</option>
         <option value="gatt">GATT（配对后可能不可用）</option>
       </select>
     </div>
-    <p class="hint muted">语音通过蓝牙传输。按键默认走 HCI 抓包（读取系统蓝牙报文中的按键通知，需要 Vokie「设备实验室」安装的特权 HCI 组件与 PacketLogger；开启/停止抓包会短暂重载蓝牙）。HCI 不可用时自动回退 IOKit 助手。切换 GATT 会重连并结束当前录音。</p>
+    <p class="hint muted">语音通过蓝牙传输。按键默认走 HCI v4 抓包（读取系统蓝牙报文中的按键通知，需要 Vokie「设备实验室」安装的特权 HCI 组件与 PacketLogger）。多个遥控器功能共享同一抓包流；首个客户端开启或最后一个客户端停止抓包时会短暂重载蓝牙。HCI 不可用时自动回退 IOKit 助手。切换 GATT 会重连并结束当前录音。</p>
     <div class="row">
       <label for="hid-seize">拦截原生按键</label>
       <input id="hid-seize" type="checkbox" checked />
-      <span class="hint muted">独占成功时拦截原生动作，确认/返回键发送给 Vokie</span>
+      <span class="hint muted">开启后由当前按键通道尝试拦截系统原生动作，确认/返回键发送给 Vokie</span>
     </div>
   </section>
 
@@ -117,11 +117,22 @@
         const src = { gatt: 'GATT', 'hci 抓包': 'HCI 抓包', 'io-kit 助手': 'IOKit 助手' }[device.hidSource] || device.hidSource;
         let hid = `按键：${src}`;
         if (device.hidSource === 'io-kit 助手' && device.hidSeizeFallback) hid += '（旁听：原生按键未拦截）';
-        if (device.hidSource === 'hci 抓包') parts.push(`HCI 抓包${device.hciPhase === 'capturing' ? '进行中' : ''}`);
         parts.push(hid);
       } else if (device.hidAvailable === false) {
         parts.push(`按键：不可用${device.hidError ? `（${device.hidError}）` : ''}`);
         if (device.hidInputMonitoring === 'denied') parts.push('输入监控未授权');
+      }
+    }
+    if (device.hidSource === 'hci 抓包' && device.hciPhase === 'capturing') {
+      parts.push('HCI v4 共享抓包中');
+      if (settings.hidSuppressNative === false) {
+        parts.push('原生按键未拦截');
+      } else if (device.hidSeized === true) {
+        parts.push('原生按键已拦截');
+      } else if (device.hidSeizeError) {
+        parts.push(`原生按键拦截失败（${device.hidSeizeError}）`);
+      } else {
+        parts.push('正在拦截原生按键');
       }
     }
     if (device.modelNumber === 'A0' && device.hciPhase === 'capturing') {

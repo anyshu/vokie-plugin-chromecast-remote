@@ -378,11 +378,29 @@ test('HCI capture: buttons work without any BLE link (the macOS 26.5 path)', asy
     await host.waitFor((m) => m.type === 'ready', 'ready');
 
     // The capture starts even though no BLE device ever connects.
-    await host.waitFor((m) => m.type === 'state' && m.extensions.device.hciPhase === 'capturing', 'hci capturing');
+    await host.waitFor((m) =>
+      m.type === 'state' && m.extensions.device.hciPhase === 'capturing' &&
+      m.extensions.device.hidSeized === true,
+    'hci capturing with HID seized');
     const request = daemon.requests.find((item) => item.command === 'startCapture');
     assert.ok(request, 'worker sent startCapture to the daemon');
     assert.equal(request.protocol, 'vokie.appleTvRemote.hci');
-    assert.equal(request.requiredVersion, '2');
+    assert.equal(request.requiredVersion, '4');
+    const seize = daemon.requests.find((item) => item.command === 'seizeHid');
+    assert.equal(seize.vendorId, 0x18d1);
+    assert.equal(seize.productId, 0x9450);
+
+    const afterCapture = host.messages.length;
+    daemon.stopCapture();
+    const retrying = await host.waitFor((m) =>
+      m.type === 'state' && m.extensions.device.hciPhase === 'retrying',
+    'hci retrying after capture stopped', 5000, afterCapture);
+    assert.equal(retrying.extensions.device.hidSeized, false);
+    assert.equal(retrying.extensions.device.hidSeizeError, null);
+    await host.waitFor((m) =>
+      m.type === 'state' && m.extensions.device.hciPhase === 'capturing' &&
+      m.extensions.device.hidSeized === true,
+    'hci recaptured with HID seized', 5000, afterCapture);
 
     // 确认键 → send_enter，返回键 → undo_last_output；松开不产生命令。
     daemon.sendNhdr(nhdrSelectDown());
@@ -399,12 +417,58 @@ test('HCI capture: buttons work without any BLE link (the macOS 26.5 path)', asy
     assert.equal(state.extensions.device.hidSource, 'hci 抓包');
     assert.equal(state.extensions.device.hciButtonCount, 4); // down×2 + up×2 edges
 
+    host.sendJson({
+      type: 'configuration_changed',
+      requestId: 'cfg-no-seize',
+      config: { hidSuppressNative: false }
+    });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-no-seize', 'disable HID seize');
+    await delay(100);
+    assert.equal(daemon.seized, false, 'daemon released HID seize');
+    assert.equal(daemon.capturing, true, 'capture stays active after releasing HID');
+
     // Stop releases the privileged capture.
     host.sendJson({ type: 'stop' });
     await host.waitFor((m) => m.type === 'stopped', 'stopped');
     await delay(150);
     assert.equal(daemon.capturing, false);
     assert.equal(daemon.sockets.length, 0);
+
+    host.sendJson({ type: 'shutdown' });
+    await host.waitFor((m) => m.type === 'destroyed', 'destroyed');
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    await exited;
+  } finally {
+    child?.kill('SIGKILL');
+    await host.close();
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('HCI capture: HID seizure failure is exposed in extension state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-seize-failure-'));
+  const daemon = new FakeHciDaemon({ seizeAllowed: false });
+  await daemon.listen(join(dir, 'hci.sock'));
+  const host = new FakePluginHost();
+  let child;
+  try {
+    await host.listen();
+    child = await startWorker(host, { VOKIE_HCI_SOCKET: join(dir, 'hci.sock') });
+    const hello = await host.waitFor((m) => m.type === 'plugin_hello', 'hello');
+    host.sendJson({ type: 'handshake_ok', pluginId: hello.manifest.id, connectionId: 'hci-seize-failure' });
+    host.sendJson({ type: 'initialize' });
+    await host.waitFor((m) => m.type === 'initialized', 'initialized');
+    host.sendJson({ type: 'configuration_changed', requestId: 'cfg-1', config: { hidSource: 'hci' } });
+    await host.waitFor((m) => m.type === 'configured' && m.requestId === 'cfg-1', 'configured');
+    host.sendJson({ type: 'start' });
+    await host.waitFor((m) => m.type === 'ready', 'ready');
+
+    const state = await host.waitFor((m) =>
+      m.type === 'state' && m.extensions.device.hciPhase === 'capturing' &&
+      m.extensions.device.hidSeizeError === 'HID seize unavailable',
+    'HID seizure failure');
+    assert.equal(state.extensions.device.hidSeized, false);
 
     host.sendJson({ type: 'shutdown' });
     await host.waitFor((m) => m.type === 'destroyed', 'destroyed');

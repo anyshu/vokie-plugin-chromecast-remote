@@ -8,13 +8,14 @@
 // GATT 2A4D subscription nor the IOKit helper ever sees them. The only
 // user-space observation point left is the Bluetooth HCI layer: the root
 // daemon installed by the Vokie device lab (/var/run/com.vokie.hci.sock,
-// protocol `vokie.appleTvRemote.hci` v2) runs PacketLogger and forwards the
+// protocol `vokie.appleTvRemote.hci` v4) runs PacketLogger and forwards the
 // nhdr stream; buttons appear there as raw ATT notifications. This mirrors
 // the app-side GoogleTvRemoteHelper (same socket, same protocol, same byte
 // semantics, field-tested 2026-09-11..13).
 //
 //   request  : {"id","protocol":"vokie.appleTvRemote.hci","command":
-//              "startCapture"|"stopCapture","requiredVersion":"2",
+//              "startCapture"|"stopCapture"|"seizeHid"|"releaseHid",
+//              "requiredVersion":"4",
 //              "caller":{"pid","uid"},"captureId","remoteDeviceId":null}
 //   response : {"type":"captureStarted"|"captureStopped"|
 //              "captureUnavailable"|"error", ...}
@@ -25,23 +26,23 @@
 // is required even when PacketLogger shows the expected name/address.
 // Profile and identity rules are ported from xiguashuo-pc 40ba1c2f.
 //
-// The daemon allows a single capture system-wide (the Apple TV Remote mic and
-// the app's own Google TV helper compete for the same slot): while another
-// capture is active it answers `captureUnavailable`, which this source keeps
-// retrying (the failure is *not* definitive). Definitive failures (socket
-// missing, version mismatch, PacketLogger missing, …) are reported with
-// `definitive: true` so `auto` mode can fall back to the IOKit helper.
+// v4 shares one PacketLogger capture among multiple clients. It can also seize
+// this remote's HID collections in the privileged process so the OK key does
+// not reach media players. Seize failure is a degraded state: HCI button
+// capture remains usable. Definitive capture failures (socket missing, version
+// mismatch, PacketLogger missing, …) are reported with `definitive: true` so
+// `auto` mode can fall back to the IOKit helper.
 //
-// Starting/stopping a capture reloads bluetoothd (one global Bluetooth
-// flap); failed attempts do not. The daemon also stops the capture when the
-// connection drops, so simply closing the socket is a clean stop.
+// The first subscriber starts the shared capture and the last subscriber
+// stops it; only those two global boundaries reload bluetoothd. The daemon
+// also removes a client's subscription when the connection drops.
 
 import { createConnection } from 'node:net';
 import { buttonReport, remoteProfile, matchesHciSource } from './remote-profile.mjs';
 import { HciIdentity, parseTraceLine, attPacket } from './hci-identity.mjs';
 
 export const HCI_PROTOCOL = 'vokie.appleTvRemote.hci';
-export const HCI_REQUIRED_VERSION = '2';
+export const HCI_REQUIRED_VERSION = '4';
 export const DEFAULT_HCI_SOCKET_PATH = '/var/run/com.vokie.hci.sock';
 
 export const REMOTE_DEVICE_NAME = 'Chromecast Remote';
@@ -52,6 +53,8 @@ const ATT_HANDLE_VALUE_NOTIFICATION = 0x1b;
 
 const CONNECT_TIMEOUT_MS = 800;
 const RETRY_MS = 5000;
+const GOOGLE_VENDOR_ID = 0x18d1;
+const CHROMECAST_REMOTE_PRODUCT_ID = 0x9450;
 
 /**
  * Parse one PacketLogger nhdr line into an ATT Handle-Value Notification.
@@ -159,7 +162,7 @@ export class HciButtonSource {
    *          error?: string|null, definitive?: boolean, retryInMs?: number|null}) => void} [options.onStatus]
    * @param {object} [options.clock] injectable {setTimer(fn, ms), clearTimer(handle)}
    */
-  constructor({ socketPath, onEdge, onStatus, onIdentity, clock } = {}) {
+  constructor({ socketPath, onEdge, onStatus, onIdentity, suppressNative, clock } = {}) {
     this.#onIdentity = onIdentity;
     this.#socketPath = socketPath ?? DEFAULT_HCI_SOCKET_PATH;
     this.#onEdge = onEdge ?? (() => {});
@@ -168,14 +171,35 @@ export class HciButtonSource {
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (handle) => clearTimeout(handle)
     };
+    this.#suppressNative = suppressNative !== false;
     this.#parser = new HciButtonValueParser();
   }
 
   #identity = new HciIdentity();
   #device = null;
   #onIdentity;
+  #suppressNative;
+  #hidSeized = false;
+  #hidSeizeError = null;
 
   get buttonsReady() { return this.active && (this.#parser.profile !== 'a0' || this.#identity.connectionHandle !== null); }
+
+  get hidSeized() { return this.#hidSeized; }
+
+  setSuppressNative(enabled) {
+    const next = enabled !== false;
+    if (next === this.#suppressNative) return;
+    this.#suppressNative = next;
+    this.#hidSeizeError = null;
+    if (!this.#captureActive) return;
+    if (next) {
+      this.#requestHidSeize();
+    } else {
+      this.#sendRequest('releaseHid');
+      this.#hidSeized = false;
+      this.#status({ phase: 'capturing', hidSeized: false, hidSeizeError: null });
+    }
+  }
 
   setDevice(device) {
     this.#device = device;
@@ -217,9 +241,11 @@ export class HciButtonSource {
   #lineBuffer = '';
   #captureActive = false;
   #requestCounter = 0;
+  #pendingCommands = new Map();
   #retryTimer = null;
   #connectTimer = null;
   #lastError = null;
+  #captureId = `chromecast-plugin-${process.pid}`;
 
   get active() {
     return this.#captureActive;
@@ -242,7 +268,19 @@ export class HciButtonSource {
   stop() {
     this.#started = false;
     this.#clearTimers();
-    this.#closeSocket();
+    const socket = this.#socket;
+    if (socket && !socket.destroyed) {
+      if (this.#hidSeized || this.#suppressNative) this.#sendRequest('releaseHid');
+      if (this.#captureActive) this.#sendRequest('stopCapture');
+      this.#captureActive = false;
+      this.#hidSeized = false;
+      this.#hidSeizeError = null;
+      this.#parser.reset();
+      this.#resetIdentity();
+      socket.end();
+    } else {
+      this.#closeSocket();
+    }
     this.#status({ phase: 'stopped', error: null });
   }
 
@@ -282,7 +320,10 @@ export class HciButtonSource {
     const socket = this.#socket;
     this.#socket = null;
     this.#captureActive = false;
+    this.#hidSeized = false;
+    this.#hidSeizeError = null;
     this.#lineBuffer = '';
+    this.#pendingCommands.clear();
     this.#parser.reset();
     this.#resetIdentity();
     if (socket) {
@@ -356,12 +397,13 @@ export class HciButtonSource {
     });
   }
 
-  #sendRequest(command) {
+  #sendRequest(command, extra = {}) {
     const socket = this.#socket;
     if (!socket || socket.destroyed) return;
     this.#requestCounter += 1;
+    const id = `chromecast-plugin-${process.pid}-${this.#requestCounter}`;
     const request = {
-      id: `chromecast-plugin-${process.pid}-${this.#requestCounter}`,
+      id,
       protocol: HCI_PROTOCOL,
       command,
       requiredVersion: HCI_REQUIRED_VERSION,
@@ -369,10 +411,22 @@ export class HciButtonSource {
         pid: process.pid,
         uid: typeof process.getuid === 'function' ? process.getuid() : null
       },
-      captureId: `chromecast-plugin-${process.pid}`,
-      remoteDeviceId: null
+      captureId: this.#captureId,
+      remoteDeviceId: null,
+      ...extra
     };
+    this.#pendingCommands.set(id, command);
     socket.write(JSON.stringify(request) + '\n');
+  }
+
+  #requestHidSeize() {
+    if (!this.#captureActive || !this.#suppressNative) return;
+    this.#hidSeized = false;
+    this.#hidSeizeError = null;
+    this.#sendRequest('seizeHid', {
+      vendorId: GOOGLE_VENDOR_ID,
+      productId: CHROMECAST_REMOTE_PRODUCT_ID
+    });
   }
 
   #handleLine(line) {
@@ -382,19 +436,34 @@ export class HciButtonSource {
     } catch {
       return;
     }
+    const command = typeof message?.id === 'string' ? this.#pendingCommands.get(message.id) : null;
+    if (typeof message?.id === 'string') this.#pendingCommands.delete(message.id);
+    if (
+      typeof message?.captureId === 'string' &&
+      message.captureId !== this.#captureId &&
+      ['captureStarted', 'captureStopped', 'nhdr'].includes(message.type)
+    ) return;
     switch (message?.type) {
       case 'captureStarted':
+        if (this.#retryTimer) {
+          this.#clock.clearTimer(this.#retryTimer);
+          this.#retryTimer = null;
+        }
         if (this.#captureActive) return;
         this.#captureActive = true;
+        this.#hidSeized = false;
+        this.#hidSeizeError = null;
         this.#parser.reset();
         this.#resetIdentity();
-        this.#status({ phase: 'capturing', error: null });
+        this.#status({ phase: 'capturing', error: null, hidSeized: false, hidSeizeError: null });
+        this.#requestHidSeize();
         console.error(`[cast-hci] capture started (${this.#socketPath})`);
         return;
       case 'captureStopped':
         // Unexpected mid-stream stop: the daemon ends the capture but keeps
         // the socket open, so ask for it again.
         this.#captureActive = false;
+        this.#hidSeized = false;
         this.#parser.reset();
         this.#resetIdentity();
         this.#scheduleRetry('HCI 抓包被停止，重新请求');
@@ -403,11 +472,48 @@ export class HciButtonSource {
       case 'captureUnavailable':
       case 'error': {
         const error = String(message.message ?? (message.type === 'error' ? 'HCI 守护进程错误' : 'HCI 抓包不可用'));
+        if (command === 'seizeHid' || command === 'releaseHid') {
+          this.#hidSeized = false;
+          this.#hidSeizeError = error;
+          this.#status({ phase: 'capturing', hidSeized: false, hidSeizeError: error });
+          console.error(`[cast-hci] HID suppression unavailable: ${error}`);
+          return;
+        }
         this.#captureActive = false;
         console.error(`[cast-hci] ${message.type}: ${error}`);
         this.#scheduleRetry(error);
         return;
       }
+      case 'versionMismatch': {
+        const actual = typeof message.version === 'string' ? message.version : '未知';
+        const error = `HCI 组件版本不兼容（需要 v${HCI_REQUIRED_VERSION}，当前 v${actual}）`;
+        this.#captureActive = false;
+        this.#scheduleRetry(error);
+        return;
+      }
+      case 'hidSeized':
+        this.#hidSeized = true;
+        this.#hidSeizeError = null;
+        this.#status({
+          phase: 'capturing',
+          hidSeized: true,
+          hidSeizeError: null,
+          hidSeizedCount: Number(message.seized ?? 0),
+          hidSeizeFailedCount: Number(message.failed ?? 0)
+        });
+        return;
+      case 'hidSeizeFailed': {
+        const error = String(message.message ?? 'HID 抢占失败');
+        this.#hidSeized = false;
+        this.#hidSeizeError = error;
+        this.#status({ phase: 'capturing', hidSeized: false, hidSeizeError: error });
+        return;
+      }
+      case 'hidReleased':
+        this.#hidSeized = false;
+        this.#hidSeizeError = null;
+        this.#status({ phase: 'capturing', hidSeized: false, hidSeizeError: null });
+        return;
       case 'nhdr':
         if (!this.#captureActive || typeof message.line !== 'string') return;
         this.#processPacketLoggerLine(message.line);

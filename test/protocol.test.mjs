@@ -21,6 +21,7 @@ import { BoundedPcmBuffer, encodeAudioFrame, pcmToBytes, upsampleX2 } from '../w
 import { HidButtonParser } from '../worker/hid-reports.mjs';
 import { HostSession } from '../worker/host-session.mjs';
 import { DeviceSession, DEFAULT_CONFIG } from '../worker/device-session.mjs';
+import { GoogleTvA0AudioDsp } from '../worker/a0-audio-dsp.mjs';
 import { BleTransport, HID_REPORT_UUID, uuidEquals } from '../worker/ble-transport.mjs';
 import { HidHelperSource } from '../worker/hid-helper-source.mjs';
 import { mkdtemp, writeFile, chmod, rm } from 'node:fs/promises';
@@ -49,6 +50,12 @@ test('capabilities parsing for v1.0 and v0.4', () => {
   assert.equal(v10.version, '1.0');
   assert.equal(v10.codecs, 0x03);
   assert.equal(v10.frameSize, 161);
+  assert.equal(v10.physicalKeepAliveSupported, true);
+  assert.equal(
+    parseCapabilities(Uint8Array.of(0x0b, 0x01, 0x00, 0x02, 0x00, 0x00, 0xa1))
+      .physicalKeepAliveSupported,
+    false
+  );
   const v04 = parseCapabilities(capabilitiesV04({ codecs: 0x02, frameSize: 120 }));
   assert.equal(v04.version, '0.4');
   assert.equal(v04.codecs, 0x02);
@@ -75,6 +82,14 @@ test('control event parsing', () => {
     parseControlEvent(audioStartPhysical({ streamId: 7 }), session),
     { type: 'audio_start', reason: 0x03, codec: 0x02, streamId: 7 }
   );
+  for (const bytes of [
+    Uint8Array.of(0x04),
+    Uint8Array.of(0x04, 0x03),
+    Uint8Array.of(0x04, 0x03, 0x02),
+    Uint8Array.of(0x04, 0x03, 0x02, 0x07, 0xff)
+  ]) {
+    assert.equal(parseControlEvent(bytes, session).type, 'unknown');
+  }
   assert.deepEqual(parseControlEvent(audioStopPhysical(), session), { type: 'audio_stop', reason: ATVV_REASON_PHYSICAL_STOP });
   assert.deepEqual(
     parseControlEvent(audioSync({ sequence: 9, predictor: -11, stepIndex: 3 }), session),
@@ -271,17 +286,27 @@ function createDeviceSession(clock, overrides = {}) {
       startSession: (mode, kind, initial) => calls.startSession.push({ mode, kind, initial: [...initial] }),
       stopSession: (reason, options) => calls.stopSession.push({ reason, ...(options ?? {}) }),
       sendCommand: (command) => calls.commands.push(command),
-      writeDevice: (bytes) => calls.writes.push([...bytes]),
+      writeDevice: (bytes) => {
+        calls.writes.push([...bytes]);
+        return overrides.writeDevice?.(bytes) ?? true;
+      },
       onAudio: (samples) => calls.audio.push([...samples]),
       onStatus: (info) => calls.status.push(info)
     }
   });
+  readyV10(session);
+  return { session, calls };
+}
+
+function readyV10(session) {
   session.deviceReady({
     name: 'Chromecast Remote',
-    atvv: { version: '1.0', codecs: 0x02, codec: 0x02, frameSize: 161, sampleRate: 16000 },
+    atvv: {
+      version: '1.0', codecs: 0x02, codec: 0x02, frameSize: 161,
+      sampleRate: 16000, physicalKeepAliveSupported: true
+    },
     hidSubscribed: true
   });
-  return { session, calls };
 }
 
 test('tap mode: short tap opens a handsfree session and a persistent mic stream', () => {
@@ -350,6 +375,161 @@ test('hold mode: a quick tap is just a very short ptt session', () => {
   assert.deepEqual(calls.stopSession, [{ reason: 'device' }]);
   assert.deepEqual(calls.audio, [[11, 41, 45, 48]]);
   assert.equal(session.phase, 'idle');
+});
+
+test('ATVV 1.0 malformed AUDIO_START does not start a stream or keepalive', () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock);
+  for (const bytes of [
+    Uint8Array.of(0x04),
+    Uint8Array.of(0x04, 0x03),
+    Uint8Array.of(0x04, 0x03, 0x02),
+    Uint8Array.of(0x04, 0x03, 0x02, 0x07, 0xff)
+  ]) {
+    session.controlEvent(parseControlEvent(bytes, session.atvv));
+  }
+  clock.advance(60000);
+  assert.equal(session.phase, 'idle');
+  assert.deepEqual(calls.startSession, []);
+  assert.deepEqual(calls.writes, []);
+  assert.equal(clock.pendingCount, 0);
+});
+
+test('hold mode: physical ATVV 1.0 streams use 10-second MIC_EXTEND', () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock);
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xa4 }), session.atvv));
+  clock.advance(9999);
+  assert.equal(calls.writes.some((bytes) => bytes[0] === 0x0e), false);
+  clock.advance(1);
+  assert.deepEqual(calls.writes.at(-1), [0x0e, 0xa4]);
+  clock.advance(10000);
+  assert.equal(calls.writes.filter((bytes) => bytes[0] === 0x0e).length, 2);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+  const afterStop = calls.writes.filter((bytes) => bytes[0] === 0x0e).length;
+  clock.advance(60000);
+  assert.equal(calls.writes.filter((bytes) => bytes[0] === 0x0e).length, afterStop);
+});
+
+test('failed physical MIC_EXTEND is disabled for the connection and restored by deviceReady', async () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock, {
+    writeDevice: (bytes) => Promise.resolve(bytes[0] !== 0x0e || bytes[1] !== 0xa1)
+  });
+  const extendWrites = () => calls.writes.filter((bytes) => bytes[0] === 0x0e);
+
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xa1 }), session.atvv));
+  clock.advance(10000);
+  await delay(0);
+  assert.deepEqual(extendWrites(), [[0x0e, 0xa1]]);
+  clock.advance(60000);
+  assert.equal(extendWrites().length, 1);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+
+  // A later physical stream on the same connection must not retry MIC_EXTEND.
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xa2 }), session.atvv));
+  clock.advance(60000);
+  assert.equal(extendWrites().length, 1);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+
+  // The host-owned stream keeps its existing four-second policy.
+  session.setConfig({ voiceMode: 'tap' });
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xa3 }), session.atvv));
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+  session.controlEvent(parseControlEvent(audioStartHost({ streamId: 0xb1 }), session.atvv));
+  clock.advance(3999);
+  assert.equal(extendWrites().length, 1);
+  clock.advance(1);
+  assert.deepEqual(extendWrites().at(-1), [0x0e, 0xb1]);
+  session.controlEvent(parseControlEvent(audioStopGeneric(0x00), session.atvv));
+
+  session.setConfig({ voiceMode: 'hold' });
+  readyV10(session);
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xc1 }), session.atvv));
+  clock.advance(10000);
+  assert.deepEqual(extendWrites().at(-1), [0x0e, 0xc1]);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+});
+
+test('rejected physical MIC_EXTEND is handled and stops later retries', async () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock, {
+    writeDevice: (bytes) => bytes[0] === 0x0e
+      ? Promise.reject(new Error('BLE write rejected'))
+      : Promise.resolve(true)
+  });
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xd1 }), session.atvv));
+  clock.advance(10000);
+  await delay(0);
+  assert.deepEqual(calls.writes.filter((bytes) => bytes[0] === 0x0e), [[0x0e, 0xd1]]);
+  clock.advance(60000);
+  assert.equal(calls.writes.filter((bytes) => bytes[0] === 0x0e).length, 1);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+});
+
+test('late physical MIC_EXTEND failure from an old connection cannot disable a new one', async () => {
+  const clock = new ManualClock();
+  let resolveOldWrite;
+  const { session, calls } = createDeviceSession(clock, {
+    writeDevice: (bytes) => {
+      if (bytes[0] !== 0x0e || bytes[1] !== 0xe1) return Promise.resolve(true);
+      return new Promise((resolve) => { resolveOldWrite = resolve; });
+    }
+  });
+
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xe1 }), session.atvv));
+  clock.advance(10000);
+  assert.equal(typeof resolveOldWrite, 'function');
+
+  session.deviceLost();
+  readyV10(session);
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 0xe2 }), session.atvv));
+  resolveOldWrite(false);
+  await delay(0);
+
+  clock.advance(10000);
+  assert.deepEqual(
+    calls.writes.filter((bytes) => bytes[0] === 0x0e),
+    [[0x0e, 0xe1], [0x0e, 0xe2]]
+  );
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+});
+
+test('hold mode: physical ATVV 0.4 streams do not send MIC_EXTEND', () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock);
+  session.deviceReady({
+    name: 'Chromecast Remote',
+    atvv: { version: '0.4', codecs: 0x01, codec: 0x01, frameSize: 7, sampleRate: 8000 },
+    hidSubscribed: true
+  });
+  session.controlEvent(parseControlEvent(Uint8Array.of(0x04, 0x03), session.atvv));
+  assert.equal(session.phase, 'holding');
+  assert.deepEqual(calls.startSession, [{ mode: 'ptt', kind: 'hold', initial: [] }]);
+  clock.advance(60000);
+  assert.equal(calls.writes.some((bytes) => bytes[0] === 0x0e), false);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+});
+
+test('A0 audio conditioning is selected once per gesture and legacy remains raw', () => {
+  const clock = new ManualClock();
+  const { session, calls } = createDeviceSession(clock);
+  const decoded = Int16Array.of(11, 41, 45, 48);
+  const expectedDsp = new GoogleTvA0AudioDsp();
+  expectedDsp.reset();
+  const expected = [...expectedDsp.process(decoded)];
+
+  session.setDeviceProfile('a0');
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 7 }), session.atvv));
+  session.setDeviceProfile('legacy'); // must apply only to the next gesture
+  session.audioData(Uint8Array.of(0x77, 0x00));
+  assert.deepEqual(calls.audio.at(-1), expected);
+  assert.notDeepEqual(calls.audio.at(-1), [...decoded]);
+  session.controlEvent(parseControlEvent(audioStopPhysical(), session.atvv));
+
+  session.controlEvent(parseControlEvent(audioStartPhysical({ streamId: 8 }), session.atvv));
+  session.audioData(Uint8Array.of(0x77, 0x00));
+  assert.deepEqual(calls.audio.at(-1), [...decoded]);
 });
 
 test('tap mode: any press duration toggles recording on (no threshold)', () => {

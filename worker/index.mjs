@@ -42,7 +42,7 @@ const manifest = {
   id: 'eb5f9200-de02-49bf-b602-57c49ebf78b9',
   name: 'Chromecast Voice Remote',
   device: { type: 'Chromecast Voice Remote', model: 'Google 18D1:9450' },
-  version: '0.4.0',
+  version: '0.5.0',
   apiVersion: '1',
   platforms: ['darwin'],
   transports: ['ble', 'hid'],
@@ -102,7 +102,8 @@ const extensionState = {
   device: {
     connected: false, name: null, atvvVersion: null, codec: null, sampleRate: null,
     hidAvailable: false, hidSource: null, hidError: null,
-    hciPhase: null, hciError: null, hciButtonCount: 0
+    hciPhase: null, hciError: null, hciButtonCount: 0,
+    hidSeized: false, hidSeizeError: null
   },
   bluetooth: { phase: 'idle', cause: null, retryInMs: null },
   session: { mode: null, phase: 'idle', accepted: false, lastEndCause: null, lastEndAt: null },
@@ -157,7 +158,7 @@ const deviceSession = new DeviceSession({
       send({ type: 'command', command, requestId: randomUUID(), timestampMs: Date.now() });
     },
     writeDevice(bytes) {
-      void transport.writeCommand(bytes);
+      return transport.writeCommand(bytes);
     },
     onAudio(samples) {
       hostSession.feed(samples);
@@ -281,6 +282,7 @@ function syncButtonSources() {
 
 const hciSource = new HciButtonSource({
   socketPath: hciSocketPath,
+  suppressNative: config.hidSuppressNative,
   onIdentity(info) {
     identitySource.setVerified(info.verified);
     updateExtensions('device', { hciIdentityVerified: info.verified, hciConnectionHandle: info.connectionHandle });
@@ -303,7 +305,11 @@ const hciSource = new HciButtonSource({
   },
   onStatus(info) {
     identitySource.setCapture(info.phase === 'capturing');
-    updateExtensions('device', { hciPhase: info.phase, hciError: info.error ?? null });
+    updateExtensions('device', {
+      hciPhase: info.phase,
+      hciError: info.error ?? null,
+      ...(info.phase === 'capturing' ? {} : { hidSeized: false, hidSeizeError: null })
+    });
     if (info.phase === 'capturing') {
       // HCI owns the buttons now; make sure the IOKit helper is not also
       // running (defensive — auto only starts it after HCI gave up).
@@ -311,7 +317,9 @@ const hciSource = new HciButtonSource({
       updateExtensions('device', {
         hidAvailable: hciSource.buttonsReady, hidSource: 'hci 抓包',
         hidError: hciSource.buttonsReady ? null : '等待 A0 设备身份验证',
-        hidSeized: false, hidSeizeFallback: false, hidInputMonitoring: null,
+        hidSeized: info.hidSeized ?? hciSource.hidSeized,
+        hidSeizeError: info.hidSeizeError ?? null,
+        hidSeizeFallback: false, hidInputMonitoring: null,
         hidRawReportCount: 0, hidLastRawReport: null
       });
     } else if (info.phase === 'retrying' && info.definitive && config.hidSource === 'auto') {
@@ -333,7 +341,9 @@ const hciSource = new HciButtonSource({
         const viaHelper = hidHelper.receiving;
         updateExtensions('device', {
           hidAvailable: viaGatt || viaHelper,
-          hidSource: viaGatt ? 'gatt' : viaHelper ? 'io-kit 助手' : null
+          hidSource: viaGatt ? 'gatt' : viaHelper ? 'io-kit 助手' : null,
+          hidSeized: false,
+          hidSeizeError: null
         });
       }
     } else if (config.hidSource === 'hci' || config.hidSource === 'auto') {
@@ -349,12 +359,15 @@ const identitySource = new RemoteIdentitySource({
   onDevice(device) {
     // Retain the known profile on helper failure/removal: an A0 must never
     // silently become a legacy device accepting unverified same-name packets.
-    hciSource.setDevice(device ?? { modelNumber: extensionState.device.modelNumber });
+    const modelNumber = device?.modelNumber ?? extensionState.device.modelNumber;
+    const profile = remoteProfile(modelNumber);
+    hciSource.setDevice(device ?? { modelNumber });
+    deviceSession.setDeviceProfile(profile);
     if (device?.deviceId) transport.setPreferredDeviceId(device.deviceId);
-    hidParser.profile = remoteProfile(device?.modelNumber ?? extensionState.device.modelNumber);
+    hidParser.profile = profile;
     hidParser.reset();
     updateExtensions('device', {
-      modelNumber: device?.modelNumber ?? extensionState.device.modelNumber ?? null,
+      modelNumber: modelNumber ?? null,
       firmwareVersion: device?.firmwareVersion ?? null,
       identityConnected: Boolean(device), identityError: null
     });
@@ -374,7 +387,12 @@ const transport = new BleTransport({
   send,
   subscribeHid: config.hidSource === 'gatt',
   onReady({ deviceId, name, atvv, hidSubscribed }) {
-    deviceSession.deviceReady({ name, atvv, hidSubscribed });
+    deviceSession.deviceReady({
+      name,
+      atvv,
+      hidSubscribed,
+      profile: remoteProfile(extensionState.device.modelNumber)
+    });
     hidParser.reset();
     const viaGatt = config.hidSource === 'gatt' && hidSubscribed === true;
     const viaHci = !viaGatt && hciSource.buttonsReady;
@@ -554,6 +572,7 @@ function handleHostMessage(message) {
       const previous = config;
       config = result.value;
       deviceSession.setConfig(config);
+      hciSource.setSuppressNative(config.hidSuppressNative);
       // Changing the native/GATT choice requires a new subscription lifecycle.
       transport.subscribeHid = config.hidSource === 'gatt';
       if (started && (config.hidSource === 'gatt') !== (previous.hidSource === 'gatt')) {
@@ -569,8 +588,9 @@ function handleHostMessage(message) {
       if (config.hidSource === 'auto' && previous.hidSource !== 'auto') {
         hciDefinitivelyUnavailable = false;
       }
-      // Keep the button sources aligned with the new settings (HCI capture
-      // start/stop reloads bluetoothd; the transport reconnects on its own).
+      // Keep the button sources aligned with the new settings. Joining the
+      // first or leaving the last HCI v4 subscription reloads bluetoothd;
+      // the transport reconnects on its own.
       syncButtonSources();
       if (started && hidHelper.running && iokitWanted() && config.hidSuppressNative !== previous.hidSuppressNative) {
         hidHelper.stop(); // restart with the new seize/observe argument

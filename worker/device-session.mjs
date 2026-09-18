@@ -36,6 +36,7 @@ import {
   codecSampleRate
 } from './atvv-protocol.mjs';
 import { BoundedPcmBuffer, upsampleX2 } from './pcm.mjs';
+import { GoogleTvA0AudioDsp } from './a0-audio-dsp.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
   // 语音键模式，二选一，决定语音键的行为与会话类型。插件不做任何手势
@@ -47,7 +48,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   voiceMode: 'hold'
 });
 
-const KEEP_ALIVE_INTERVAL_MS = 4000;
+const HOST_KEEP_ALIVE_INTERVAL_MS = 4000;
+const PHYSICAL_KEEP_ALIVE_INTERVAL_MS = 10000;
 const MIC_OPEN_CONFIRM_TIMEOUT_MS = 1000;
 const MIC_OPEN_MAX_ATTEMPTS = 3;
 
@@ -59,7 +61,7 @@ const MIC_OPEN_MAX_ATTEMPTS = 3;
  * @param {(mode: string, kind: string, initialSamples: Int16Array) => void} options.hooks.startSession
  * @param {(reason: string, options?: {cancel?: boolean}) => void} options.hooks.stopSession
  * @param {(command: 'send_enter'|'undo_last_output') => void} options.hooks.sendCommand
- * @param {(bytes: Uint8Array) => void} options.hooks.writeDevice
+ * @param {(bytes: Uint8Array) => boolean|Promise<boolean>|void} options.hooks.writeDevice
  * @param {(samples: Int16Array) => void} options.hooks.onAudio
  * @param {(status: object) => void} options.hooks.onStatus
  */
@@ -81,6 +83,7 @@ export class DeviceSession {
     this.#config = { ...DEFAULT_CONFIG, ...(config ?? {}) };
     this.#decoder = new AtvvAudioDecoder();
     this.#gestureBuffer = new BoundedPcmBuffer();
+    this.#a0AudioDsp = new GoogleTvA0AudioDsp();
     this.reset();
   }
 
@@ -89,6 +92,9 @@ export class DeviceSession {
   #config;
   #decoder;
   #gestureBuffer;
+  #a0AudioDsp;
+  #activeAudioDsp = null;
+  #deviceProfile = 'legacy';
 
   // 'idle' | 'pressing' | 'holding' | 'persistent'
   phase = 'idle';
@@ -101,6 +107,10 @@ export class DeviceSession {
   #streamId = 0;
   #sessionMode = null;
   #keepAliveTimer = null;
+  #keepAliveIntervalMs = null;
+  #keepAliveKind = null;
+  #physicalKeepAliveDisabled = false;
+  #connectionGeneration = 0;
   #micOpenTimer = null;
   #micOpenAttempts = 0;
   #hostStreamConfirmed = false;
@@ -118,6 +128,10 @@ export class DeviceSession {
     this.#config = { ...this.#config, ...config };
   }
 
+  setDeviceProfile(profile) {
+    this.#deviceProfile = profile === 'a0' ? 'a0' : 'legacy';
+  }
+
   reset() {
     this.#clearGestureTimers();
     this.#gesture = null;
@@ -126,20 +140,27 @@ export class DeviceSession {
     this.#sessionMode = null;
     this.#hostStreamConfirmed = false;
     this.#micOpenAttempts = 0;
+    this.#activeAudioDsp?.reset();
+    this.#activeAudioDsp = null;
     this.phase = 'idle';
     this.#gestureBuffer.clear();
     this.#decoder.reset();
   }
 
-  deviceReady({ name, atvv, hidSubscribed }) {
+  deviceReady({ name, atvv, hidSubscribed, profile }) {
     this.reset();
+    this.#connectionGeneration += 1;
+    this.#physicalKeepAliveDisabled = false;
+    if (profile !== undefined) this.setDeviceProfile(profile);
     this.atvv = atvv;
     this.deviceName = name ?? null;
     this.hidSubscribed = hidSubscribed === true;
   }
 
   deviceLost() {
+    this.#connectionGeneration += 1;
     const hadSession = this.#sessionMode !== null;
+    if (hadSession) this.#flushAudioProcessor();
     this.reset();
     if (hadSession) this.#hooks.stopSession('device_lost', { cancel: true });
   }
@@ -148,6 +169,7 @@ export class DeviceSession {
   teardown() {
     if (this.#streamActive) this.#writeMicClose();
     const hadSession = this.#sessionMode !== null;
+    if (hadSession) this.#flushAudioProcessor();
     this.reset();
     return hadSession;
   }
@@ -182,7 +204,8 @@ export class DeviceSession {
     if (!this.#streamActive || !this.atvv) return;
     const frame = this.#decoder.decode(bytes, this.atvv);
     if (!frame || !frame.samples.length) return;
-    const samples = this.#resample(frame.samples);
+    const resampled = this.#resample(frame.samples);
+    const samples = this.#activeAudioDsp?.process(resampled) ?? resampled;
     if (this.phase === 'pressing') {
       this.#gestureBuffer.push(samples);
       return;
@@ -235,7 +258,8 @@ export class DeviceSession {
     this.#streamActive = true;
     this.#streamId = event.streamId ?? 0;
     this.#decoder.beginStream();
-    this.#startKeepAlive();
+    const physical = event.reason === ATVV_REASON_PHYSICAL_START;
+    this.#startKeepAlive(physical ? 'physical' : 'host', event);
     this.#log(`audio_start reason=0x${event.reason.toString(16)} streamId=${this.#streamId} phase=${this.phase}`);
 
     if (event.reason === ATVV_REASON_PHYSICAL_START) {
@@ -255,6 +279,7 @@ export class DeviceSession {
       // idle: fresh gesture. The mode decides what the key means — no
       // duration interpretation in either mode.
       this.#gesture = { startedAt: this.#clock.now(), sessionWasActive: false };
+      this.#beginAudioProcessing();
       if (this.#config.voiceMode === 'hold') {
         // 长按模式：语音键即 PTT —— 按下立即开会话，音频经 host 会话的
         // 预接受缓冲补发，抬起结束。
@@ -309,6 +334,7 @@ export class DeviceSession {
       // 的一次会话）；短按模式会话进行中的按下-抬起（切换关）。
       if (this.#sessionMode !== null) {
         this.#log(`closing session at release (duration=${duration.toFixed(0)} ms)`);
+        this.#flushAudioProcessor();
         this.#hooks.stopSession('device');
       }
       this.#writeMicClose();
@@ -326,7 +352,7 @@ export class DeviceSession {
         // host-owned, so ignore it instead of tearing the session down.
         this.#log('ignoring stray physical release while persistent');
         this.#streamActive = true; // treat the stream as still alive
-        this.#startKeepAlive();
+        this.#startKeepAlive('host');
         return;
       }
       if (this.#micOpenTimer) {
@@ -335,7 +361,10 @@ export class DeviceSession {
         return;
       }
       this.#log(`persistent stream ended (reason=0x${event.reason.toString(16)}) -> closing session`);
-      if (this.#sessionMode !== null) this.#hooks.stopSession('device');
+      if (this.#sessionMode !== null) {
+        this.#flushAudioProcessor();
+        this.#hooks.stopSession('device');
+      }
       this.#writeMicClose();
       this.reset();
       this.#hooks.onStatus({ phase: 'idle' });
@@ -345,7 +374,10 @@ export class DeviceSession {
       // Physical stream aborted without a release event.
       this.#log(`stream aborted without release (phase=${this.phase})`);
       this.#clearGestureTimers();
-      if (this.#sessionMode !== null) this.#hooks.stopSession('device');
+      if (this.#sessionMode !== null) {
+        this.#flushAudioProcessor();
+        this.#hooks.stopSession('device');
+      }
       this.reset();
       this.#hooks.onStatus({ phase: 'idle', aborted: true });
     }
@@ -399,7 +431,7 @@ export class DeviceSession {
 
   #writeMicOpen() {
     if (!this.atvv) return;
-    this.#hooks.writeDevice(micOpenCommand(this.atvv.version, this.atvv.codec));
+    void this.#writeDevice(micOpenCommand(this.atvv.version, this.atvv.codec));
   }
 
   #log(message) {
@@ -410,16 +442,59 @@ export class DeviceSession {
 
   #writeMicClose() {
     if (!this.atvv) return;
-    this.#hooks.writeDevice(micCloseCommand(this.atvv.version, this.#streamId));
+    void this.#writeDevice(micCloseCommand(this.atvv.version, this.#streamId));
   }
 
-  #startKeepAlive() {
+  #writeDevice(bytes) {
+    try {
+      return Promise.resolve(this.#hooks.writeDevice(bytes)).then(
+        (written) => written !== false,
+        () => false
+      );
+    } catch {
+      return Promise.resolve(false);
+    }
+  }
+
+  #startKeepAlive(kind, event) {
     this.#stopKeepAlive();
-    this.#keepAliveTimer = this.#clock.setTimer(() => {
-      if (!this.#streamActive || !this.atvv) return;
-      this.#hooks.writeDevice(keepAliveCommand(this.atvv.version, this.#streamId, this.atvv.codec));
-      this.#startKeepAlive(); // re-arm while streaming
-    }, KEEP_ALIVE_INTERVAL_MS);
+    if (
+      kind === 'physical' &&
+      (
+        this.atvv?.version !== '1.0' ||
+        this.atvv.physicalKeepAliveSupported !== true ||
+        this.#physicalKeepAliveDisabled ||
+        ![1, 2].includes(event.codec)
+      )
+    ) return;
+    this.#keepAliveIntervalMs = kind === 'physical'
+      ? PHYSICAL_KEEP_ALIVE_INTERVAL_MS
+      : HOST_KEEP_ALIVE_INTERVAL_MS;
+    this.#keepAliveKind = kind;
+    this.#keepAliveTimer = this.#clock.setTimer(
+      () => this.#runKeepAlive(),
+      this.#keepAliveIntervalMs
+    );
+  }
+
+  #runKeepAlive() {
+    this.#keepAliveTimer = null;
+    if (!this.#streamActive || !this.atvv || this.#keepAliveIntervalMs === null) return;
+    const kind = this.#keepAliveKind;
+    const generation = this.#connectionGeneration;
+    const write = this.#writeDevice(keepAliveCommand(this.atvv.version, this.#streamId, this.atvv.codec));
+    this.#keepAliveTimer = this.#clock.setTimer(
+      () => this.#runKeepAlive(),
+      this.#keepAliveIntervalMs
+    );
+    if (kind === 'physical') {
+      void write.then((written) => {
+        if (written || generation !== this.#connectionGeneration) return;
+        this.#physicalKeepAliveDisabled = true;
+        if (this.#keepAliveKind === 'physical') this.#stopKeepAlive();
+        this.#log('physical MIC_EXTEND failed; disabling it until reconnect');
+      }).catch(() => {});
+    }
   }
 
   #stopKeepAlive() {
@@ -427,6 +502,8 @@ export class DeviceSession {
       this.#clock.clearTimer(this.#keepAliveTimer);
       this.#keepAliveTimer = null;
     }
+    this.#keepAliveIntervalMs = null;
+    this.#keepAliveKind = null;
   }
 
   #clearGestureTimers() {
@@ -439,5 +516,17 @@ export class DeviceSession {
 
   #resample(samples) {
     return this.atvv && codecSampleRate(this.atvv.codec) === 8000 ? upsampleX2(samples) : samples;
+  }
+
+  #beginAudioProcessing() {
+    this.#activeAudioDsp = this.#deviceProfile === 'a0' ? this.#a0AudioDsp : null;
+    this.#activeAudioDsp?.reset();
+  }
+
+  #flushAudioProcessor() {
+    const processor = this.#activeAudioDsp;
+    this.#activeAudioDsp = null;
+    const tail = processor?.flush() ?? new Int16Array();
+    if (tail.length) this.#hooks.onAudio(tail);
   }
 }

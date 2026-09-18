@@ -71,7 +71,8 @@ export function parseControlEvent(bytes, session) {
     case OPCODE_AUDIO_STOP:
       return { type: 'audio_stop', reason: bytes.length > 1 ? bytes[1] : 0 };
     case OPCODE_AUDIO_START: {
-      if (session?.version === ATVV_VERSION_V10 && bytes.length >= 4) {
+      if (session?.version === ATVV_VERSION_V10) {
+        if (bytes.length !== 4) return { type: 'unknown', bytes };
         return {
           type: 'audio_start',
           reason: bytes[1],
@@ -133,7 +134,10 @@ export function parseCapabilities(bytes) {
       version: ATVV_VERSION_V10,
       codecs: bytes[3],
       interactionModel: bytes[4],
-      frameSize: (bytes[5] << 8) | bytes[6]
+      frameSize: (bytes[5] << 8) | bytes[6],
+      // The physical-stream MIC_EXTEND behavior was verified only with the
+      // complete nine-byte v1 capability response used by the remote.
+      physicalKeepAliveSupported: bytes.length >= 9
     };
   }
   return null;

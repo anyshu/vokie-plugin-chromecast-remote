@@ -219,7 +219,10 @@ export const ATVV = {
 };
 
 export function capabilitiesV10({ codecs = 0x02, interaction = 0x00, frameSize = 161 } = {}) {
-  return Uint8Array.of(0x0b, 0x01, 0x00, codecs, interaction, (frameSize >> 8) & 0xff, frameSize & 0xff);
+  return Uint8Array.of(
+    0x0b, 0x01, 0x00, codecs, interaction,
+    (frameSize >> 8) & 0xff, frameSize & 0xff, 0x00, 0x00
+  );
 }
 
 export function capabilitiesV04({ codecs = 0x02, frameSize = 161 } = {}) {
@@ -274,7 +277,7 @@ export function hidReport(usage) {
 }
 
 // ---------------------------------------------------------------------------
-// Fake privileged HCI capture daemon (protocol `vokie.appleTvRemote.hci` v2)
+// Fake privileged HCI capture daemon (protocol `vokie.appleTvRemote.hci` v4)
 // and PacketLogger nhdr line builders, mirroring the real root daemon
 // (/var/run/com.vokie.hci.sock) used for button capture on macOS 26.5.
 
@@ -314,15 +317,20 @@ export function nhdrButtonUp() {
 }
 
 export class FakeHciDaemon {
-  constructor({ version = '2', captureAllowed = true, unavailableMessage = 'another capture is active' } = {}) {
+  constructor({ version = '4', captureAllowed = true, unavailableMessage = 'PacketLogger executable is missing', seizeAllowed = true } = {}) {
     this.version = version;
     this.captureAllowed = captureAllowed;
     this.unavailableMessage = unavailableMessage;
+    this.seizeAllowed = seizeAllowed;
     this.requests = [];
     this.sockets = [];
-    this.capturing = false;
+    this.captureSubscriptions = new Map();
+    this.seizeOwner = null;
     this.server = createNetServer((socket) => this.#accept(socket));
   }
+
+  get capturing() { return this.captureSubscriptions.size > 0; }
+  get seized() { return this.seizeOwner !== null; }
 
   listen(path) {
     return new Promise((resolve, reject) => {
@@ -337,22 +345,27 @@ export class FakeHciDaemon {
   }
 
   sendNhdr(line) {
-    this.#send({ type: 'nhdr', captureId: 'fake', line });
+    for (const [socket, captureId] of this.captureSubscriptions) {
+      socket.write(JSON.stringify({ type: 'nhdr', captureId, line }) + '\n');
+    }
   }
 
   stopCapture() {
-    this.capturing = false;
-    this.#send({ type: 'captureStopped', captureId: 'fake' });
+    for (const [socket, captureId] of this.captureSubscriptions) {
+      socket.write(JSON.stringify({ type: 'captureStopped', captureId }) + '\n');
+    }
+    this.captureSubscriptions.clear();
   }
 
   #accept(socket) {
     this.sockets.push(socket);
     socket.setEncoding('utf8');
-    // Mirror the real daemon: the capture is owned by its client connection
-    // and stops when that connection drops.
+    // Mirror v4: one PacketLogger process is shared by all subscribed client
+    // connections; HID seizure remains single-owner and is released on close.
     socket.on('close', () => {
       this.sockets = this.sockets.filter((item) => item !== socket);
-      this.capturing = false;
+      this.captureSubscriptions.delete(socket);
+      if (this.seizeOwner === socket) this.seizeOwner = null;
     });
     let buffer = '';
     socket.on('data', (chunk) => {
@@ -374,19 +387,40 @@ export class FakeHciDaemon {
       return;
     }
     this.requests.push(request);
+    if (request.requiredVersion !== this.version) {
+      socket.write(JSON.stringify({ type: 'versionMismatch', version: this.version, id: request.id }) + '\n');
+      return;
+    }
     switch (request.command) {
       case 'startCapture':
         if (!this.captureAllowed) {
-          this.capturing = false;
           socket.write(JSON.stringify({ type: 'captureUnavailable', message: this.unavailableMessage, id: request.id }) + '\n');
           return;
         }
-        this.capturing = true;
+        this.captureSubscriptions.set(socket, request.captureId);
         socket.write(JSON.stringify({ type: 'captureStarted', captureId: request.captureId, id: request.id }) + '\n');
         return;
       case 'stopCapture':
-        this.capturing = false;
+        if (this.captureSubscriptions.get(socket) === request.captureId) {
+          this.captureSubscriptions.delete(socket);
+        }
         socket.write(JSON.stringify({ type: 'captureStopped', captureId: request.captureId, id: request.id }) + '\n');
+        return;
+      case 'seizeHid':
+        if (!this.seizeAllowed) {
+          socket.write(JSON.stringify({ type: 'hidSeizeFailed', message: 'HID seize unavailable', id: request.id }) + '\n');
+          return;
+        }
+        if (this.seizeOwner && this.seizeOwner !== socket) {
+          socket.write(JSON.stringify({ type: 'hidSeizeFailed', message: 'HID seize already active', id: request.id }) + '\n');
+          return;
+        }
+        this.seizeOwner = socket;
+        socket.write(JSON.stringify({ type: 'hidSeized', seized: 1, failed: 0, details: ['0x0:seized'], id: request.id }) + '\n');
+        return;
+      case 'releaseHid':
+        if (this.seizeOwner === socket) this.seizeOwner = null;
+        socket.write(JSON.stringify({ type: 'hidReleased', id: request.id }) + '\n');
         return;
       case 'health':
       case 'version':
@@ -397,8 +431,4 @@ export class FakeHciDaemon {
     }
   }
 
-  #send(object) {
-    const payload = JSON.stringify(object) + '\n';
-    for (const socket of this.sockets) socket.write(payload);
-  }
 }

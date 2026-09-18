@@ -1,128 +1,172 @@
-# Vokie Plugin · Chromecast Voice Remote
+# Chromecast Voice Remote for Vokie
 
-当前版本：**0.4.0**。
+把 Google Chromecast Voice Remote 变成 Vokie 的蓝牙语音输入控制器：**按住说话，或点按免提；确认键发送，返回键撤销。**
 
-把 Google Chromecast Voice Remote（VID `0x18D1` / PID `0x9450`）变成 Vokie 的蓝牙语音输入与确认控制器。
+当前版本 **0.5.0**，基础功能已完成。支持 macOS，适配 Google Chromecast Voice Remote（VID `0x18D1` / PID `0x9450`）。本项目是 Vokie 插件，需要由 Vokie 主应用加载，不是独立运行的电视遥控软件。
+
+支持 **A0 / 26.2** 遥控器和旧款 `hid_mouse`。插件自动读取实际型号与固件，按型号解析确认 / 返回键；A0 的 HCI 按键须完成设备身份验证后才启用，语音会在解码与重采样后应用专用 DSP 和 -6 dBFS 峰值保护。
 
 ## 功能
 
-| 遥控器按键 | Vokie 动作 |
+| 操作 | 效果 |
 | --- | --- |
-| 语音键（模式二选一） | **长按模式**（默认，PTT）：按下语音键立即开始录音（`ptt` 会话），松开结束——快速点按只是一次很短的会话。**短按模式**（Hands-free PTT）：每按一下语音键切换录音开关（`handsfree-ptt` 会话），按一下开始、再按一下结束。 |
-| 返回键 | 撤销上一次输出（`undo_last_output` 命令） |
-| 确认键 | 发送（回车确认输出，`send_enter` 命令） |
+| 语音键 · 长按模式（默认） | 按下立即录音，松开结束，使用 Vokie PTT 会话 |
+| 语音键 · 短按模式 | 按一下开始录音，再按一下结束，使用 Vokie Hands-free PTT 会话 |
+| 确认键 | 发送 / 回车确认输出 |
+| 返回键 | 撤销上一次输出 |
 
-插件**不做任何手势时长判定**：`voiceMode` 设置决定语音键的行为与会话类型（`hold` → `ptt`，`tap` → `handsfree-ptt`），Worker 只按设置执行。"长按"和"短按"只是用户对两种模式的叫法。
+- **自动连接与恢复**：扫描匹配的遥控器，协商语音协议；可恢复的连接故障会自动重试，断连时取消当前录音。
+- **独立的语音与按键通道**：语音通过 BLE 传输；确认 / 返回键默认通过 HCI 抓包读取，按键不可用不等于语音不可用。
+- **即改即用的设置页**：切换语音模式和按键来源，查看设备连接、按键通道、插件版本、当前会话及上次结束原因。
 
-## 0.4.0：支持 A0 / 26.2 遥控器
+> 长按 / 短按是两种可选模式，**不是自动识别按压时长**。长按模式下快速点按只会产生一次很短的录音。当前只映射语音、确认、返回三个按键，不提供其他按键映射，也未启用独立长录音、翻译或实时翻译能力。
 
-新增支持 **A0 / 26.2** 遥控器，兼容旧款 `hid_mouse`。插件自动读取实际型号与固件，按型号解析确认 / 返回键；A0 的 HCI 按键须完成设备身份验证后才启用。
+## 使用前准备
 
-- A0 确认 / 返回键采用 `0x0029` 八字节报告；旧款继续使用 `0x002B` 两字节报告。
-- 有 HID 身份时按其外设 UUID 选择语音连接；A0 用序列号回读绑定 HCI 连接，全零地址也必须经过验证。多只遥控器同时在线时保持已选设备，暂不提供手动选择。
-- A0 要求 Host BLE 适配器按特征属性支持无响应写入，当前 xiguashuo-pc 已实现；语音仍通过 ATVV UUID 订阅。
-- 内置助手新增 `--identity` 模式，只枚举 HID 身份；抓包开启后才对 A0 指定 UUID 读取序列号，不订阅或写入 ATVV。设置页显示实际型号、固件和验证状态。
+- **macOS + Vokie**：Vokie 需支持插件 API v1 和 Host BLE 适配器；A0 还要求适配器按特征属性支持无响应写入（当前 xiguashuo-pc 已实现）。其他平台暂不支持。
+- **Chromecast Voice Remote**：为完整使用语音和按键功能，先在 macOS 蓝牙设置中完成配对，并保持遥控器唤醒。
+- **蓝牙权限**：按系统提示允许 Vokie 使用蓝牙。
+- **确认 / 返回键所需组件**：通过 Vokie「设备实验室」安装特权 HCI 组件 `com.vokie.hcihelper`，并准备位于 `/Applications/PacketLogger.app` 的 PacketLogger。插件本身不包含这两个组件。
 
-迁移来源、协议约束及验证记录见 [A0 新款兼容规格](spec/a0-remote-support.md)。自动化通过不替代 A0 真机验收。
+> **macOS 26.5 注意事项**：当前实测环境下，确认 / 返回键需要 HCI 抓包；缺少上述组件时，即使自动回退到 IOKit 助手，按键仍不可用，语音链路不依赖这些组件。HCI v4 允许插件、Apple TV 麦克风和主应用 Google TV 遥控器共享同一份 PacketLogger 抓包；只有第一个订阅开始和最后一个订阅结束时才会切换全局抓包，边界操作可能短暂重载系统蓝牙并影响其他蓝牙设备。
 
-## 0.3.0 修复：确认/返回键在 macOS 26.5 上不可用
+## 快速开始
 
-macOS 26.5 堵死了插件进程可直达的所有 HID 读取路径（IOKit 独占/共享、事件系统、CGEventTap、GATT `2A4D`；逐层实测见 [spec/hid-macos-limitations.md](spec/hid-macos-limitations.md)）。0.3.0 新增**HCI 抓包按键通道**：Worker 连接 Vokie 设备实验室安装的特权 HCI 守护进程（`/var/run/com.vokie.hci.sock`，与主应用 Google TV 遥控器同一组件、同一协议），在蓝牙层解析遥控器发给系统 HID 栈的按键通知（GATT 句柄 `0x002B`：`41 00` 确认按下、`24 02` 返回按下）。`hidSource: auto` 优先使用该通道，HCI 确定性不可用（组件未安装、PacketLogger 缺失等）时回退 IOKit 助手；抓包被其他组件（如 Apple TV 麦克风抓包）占用时每 5 秒安静重试。详见 [spec/hci-button-source.md](spec/hci-button-source.md)。
+1. 在 Vokie 插件页安装本插件的打包 ZIP；也可按下方方式从源码目录安装。
+2. 完成上述配对、权限与组件准备，启用插件。Worker 由 Vokie 启动，不需要手动运行。
+3. 打开插件设置页，等待显示「遥控器已连接」，并确认按键来源 / 可用状态。
+4. 默认使用**长按模式**：按住语音键说话，松开结束；在 Vokie 输出后，按确认键发送，或按返回键撤销。
+5. 如需免提，在设置中选择**短按模式**，按一下语音键开始，再按一下结束。
 
-## 0.2.6 修复
+### 从源码目录安装 / 更新
 
-修正通知订阅返回 `failed: The request is not supported. (notify_failed)` 时被误判为整个 BLE 适配器不可用的问题。可选的 ATVV 命令回显订阅失败后继续语音协商；可选 GATT HID 失败仅报告按键不可达。必需的控制/音频订阅失败仍释放连接后重试，并保留特征 UUID 和原始错误。明确的后端不可用、权限拒绝和协议错误仍会停止重试。此修复不代表原生 HID 已恢复报文。
+将本仓库目录复制到 Vokie 的插件目录：
 
-## 工作原理
-
-- **语音（BLE，走 Vokie Host 适配器）**：`ble_scan` / `ble_connect` / `ble_start_notify` / `ble_write`（`apiVersion: "1"`）。扫描使用 ATVV 服务与 Chromecast 名称过滤，并用 `connectedServiceUuids`（ATVV / `1812` / `180F`）找回系统已连接设备。只有名称为 `Chromecast Remote` / `Chromecast Voice Remote` 的设备进入连接候选；共享 ATVV 服务或电池/HID 缓存命中不是型号凭据，小米及无名称设备会被忽略。连接后通过必需 ATVV 特征订阅与 capabilities 协商验证语音链路；失败先等待 Host 完成断开，再按 1s→8s 退避重试。详见 [BLE 接入规格](spec/ble-device-isolation.md)。
-- **语音协议（Google ATVV）**：服务 `AB5E0001-…`，命令写 `…0002`，音频通知 `…0003`，控制通知 `…0004`。语音键手势不经 HID：`AUDIO_START reason 0x03`（按下）/ `AUDIO_STOP reason 0x02`（松开）。长按模式在按下瞬间即 `session_start`，接受往返期间的音频由 Host 会话预接受缓冲补发；短按模式按住期间音频本地有界缓冲（约 2 s，超限丢最旧），抬起开启会话时补发，并立即发送 `MIC_OPEN` 转持续收音：开麦确认按 ~1s 间隔有限重试（3 次，对齐 vRemoter 1.1.1 的修复），期间 BLE 重传的重复"松手"通知会被忽略，不误杀会话；重试耗尽以 `session_cancel` 放弃（不产生空输出）。再次按下发送 `MIC_CLOSE` 结束。支持 ATVV v0.4 / v1.0，优先 ADPCM 16 kHz；8 kHz 线性插值重采样到 16 kHz，以 `pcm_s16le` 二进制帧（4 字节 BE 头长 + JSON 头 + PCM）发给 Vokie；流式期间每 4 s keep-alive。Worker stderr 输出 `[cast-atvv]`（设备事件）与 `[cast-session]`（会话结束原因 + 帧数）前缀的日志；插件设置页「当前会话」一栏也会显示最近一次会话的结束原因（如 `host_success（12 帧音频）`、`device_lost(cancel)（0 帧音频）`），便于现场诊断。
-- **按键（HCI 抓包主通道 + 原生 HID 备选）**：
-  1. **HCI 抓包通道**（`auto` 默认，macOS 26.5 唯一可用路径）：Worker 直连 Vokie 特权 HCI 守护进程（`/var/run/com.vokie.hci.sock`，协议 `vokie.appleTvRemote.hci` v2，需设备实验室安装的特权组件与 `/Applications/PacketLogger.app`），订阅 PacketLogger nhdr 流并解析蓝牙层 ATT Handle-Value Notification——确认 `41 00`、返回 `24 02`、松开 `00 00`（GATT 句柄 `0x002B`）。按下去重、松开合成边沿，仅 `select`/`back` 按下沿触发命令。抓包系统级独占（与 Apple TV 麦克风抓包互斥），占用方冲突时每 5 秒重试；开始/停止抓包会重载 bluetoothd（一次全局蓝牙闪断），语音 BLE 链路靠退避自动恢复。HCI 确定性不可用时 `auto` 回退 IOKit 助手。
-  2. **IOKit 助手通道**（`iohid`）：内置 `assets/chromecast-hid-helper`（Swift 编译的独立二进制，vRemoter 同款 IOKit 机制）。macOS 26.5 上系统 HID 栈独占报文通道，该通道实测收不到报文，仅保留给旧系统与诊断。
-  3. **GATT 通道**（`gatt`，显式诊断用）：HID 报告特征 `2A4D`。系统配对后 macOS 隐藏整个 `1812` 服务，未配对时遥控器不暴露 HID，可用性取决于系统行为。
-  - `hidSource` 设置：`auto`（默认，HCI 抓包优先，确定性失败回退 IOKit）/ `hci`（仅 HCI 抓包）/ `iohid`（仅 IOKit 助手）/ `gatt`（仅 GATT）。auto 与 hci/iohid 模式不订阅 `2A4D`。切换来源会重连并结束当前录音。
-  - 助手默认 `--seize`，由 manager 统一独占匹配接口以拦截原生按键；打开失败时先完整关闭，再创建新的 manager 尝试共享模式。`hidSuppressNative: false` 直接使用 `--observe`。共享回退不保证收到报文，也不保证免权限；状态页仅在实际收到有效按键报文后显示 IOKit 通道可用，回退时标注原生按键未拦截。助手输出权限检查结果、接口数量和原始错误码，随 Worker 退出释放设备（SIGTERM / stdin EOF）。详见 [HID 修复规格](spec/hid-helper.md)。
-
-## 目录结构
-
-```
-vokie.plugin.json        # 插件清单（id 为不可变 UUID）
-worker/
-  index.mjs              # Host WebSocket 生命周期、会话桥接、命令路由
-  hci-button-source.mjs  # HCI 抓包按键源（特权守护进程 + nhdr/ATT 解析）
-  ble-transport.mjs      # Host BLE 适配器客户端 + 连接管理/重连
-  ble-device-selection.mjs # 型号筛选与失败候选冷却
-  device-session.mjs     # 语音键手势状态机（hold / tap 两模式）
-  atvv-protocol.mjs      # ATVV 控制事件、命令、ADPCM 帧解码
-  hid-reports.mjs        # HID 按键报文解析（GATT 与助手共用）
-  hid-helper-source.mjs  # IOKit 助手进程管理（启动/重启/清理）
-  host-session.mjs       # Vokie 会话簿记（requestId / 预接受缓冲 / 音频帧）
-  pcm.mjs                # 重采样、PCM 编码、有界缓冲
-native/
-  chromecast-hid-helper.swift  # CLI、信号与 stdin 生命周期
-  HidBridge.swift              # manager 级 HID 打开、回退、接口跟踪与报文
-  HIDDiagnostics.swift        # JSON 输出、权限只读检查、错误分类
-  HIDReport.swift             # 可测试的 HID 报文规范化，不猜测未知 report ID
-  build-helper.sh              # 重建助手二进制
-assets/
-  chromecast-hid-helper # 预编译助手（arm64）
-  icon.svg, vokie-plugin-sdk.js
-ui/index.html            # 状态/设置页
-test/                    # 单元测试 + fake Host/设备/HCI 守护进程端到端测试
+```text
+<userData>/plugins/eb5f9200-de02-49bf-b602-57c49ebf78b9/
 ```
 
-## 安装与运行
+`<userData>` 是 Vokie 的实际用户数据目录；插件 ID 见 [vokie.plugin.json](vokie.plugin.json)。Worker 仅依赖 Node.js 内建模块，需要 **Node.js 22 或更高版本**，无需 `npm install`。
 
-把本目录复制为 `<userData>/plugins/<pluginId>`（或在 Vokie PC 的插件页安装本目录的打包 zip）。Worker 仅依赖 Node 内建模块（Node ≥ 22 的全局 `WebSocket`），无需 `npm install`。插件页显示实际运行版本，启动日志 `[cast-plugin]` 记录插件 ID、版本和加载路径。修改仓库不会自动更新安装目录。
+更新时重新安装 ZIP，或替换安装目录后重新启动插件。**修改本仓库不会自动更新已安装副本**；以插件设置页显示的运行版本为准。
 
-> **注意（可执行位）**：Host 直接 spawn `worker/index.mjs` 与 `assets/chromecast-hid-helper`（均依赖 shebang 与可执行位，仓库已按 `755` 提交）。若拷贝/解压方式不保留 Unix 权限（安装后报 `spawn … EACCES`），执行：
->
-> ```bash
-> chmod +x <userData>/plugins/<pluginId>/worker/index.mjs <userData>/plugins/<pluginId>/assets/chromecast-hid-helper
-> ```
->
-> Worker 也会在启动助手时自动修复助手的执行位。
+若拷贝 / 解压没有保留 Unix 可执行权限，启动时可能报 `spawn … EACCES`。将下面路径替换为实际安装路径后执行：
+
+```sh
+chmod +x '<插件安装目录>/worker/index.mjs' '<插件安装目录>/assets/chromecast-hid-helper'
+```
+
+Worker 也会在启动 IOKit 助手时尝试自动修复助手的可执行位。
 
 ## 设置
 
-设置页**改动即存**（无需保存按钮）：UI 通过 configure 桥把变更发给 Host，Worker 确认后立即生效，页面显示「✓ 已生效」反馈。
+设置页**改动即保存**，无需保存按钮；Vokie 确认后显示「✓ 已生效」。
 
-| 键 | 类型 | 默认 | 说明 |
+| 设置 | 配置键 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `voiceMode` | `hold` \| `tap` | `hold` | 语音键模式（二选一）：长按模式（PTT）/ 短按模式（Hands-free PTT） |
-| `hidSource` | `auto` \| `hci` \| `iohid` \| `gatt` | `auto` | 按键通道选择：自动（HCI 抓包优先，失败回退 IOKit）/ 仅 HCI 抓包 / 仅 IOKit 助手 / 仅 GATT |
-| `hidSuppressNative` | boolean | `true` | IOKit 助手独占设备、拦截遥控器原生按键 |
+| 语音键模式 | `voiceMode` | `hold` | `hold`：按住说话（PTT）；`tap`：点按切换（Hands-free PTT） |
+| 按键来源 | `hidSource` | `auto` | `auto`：HCI 优先，确定性不可用时回退 IOKit；`hci`：仅 HCI；`iohid`：仅 IOKit 助手；`gatt`：仅 GATT，供诊断使用 |
+| 拦截原生按键 | `hidSuppressNative` | `true` | HCI 抓包通过特权组件抢占 HID，IOKit 助手尝试独占设备；设为 `false` 时不抢占。抢占失败只表示原生动作未拦截，不影响 HCI 按键读取；GATT 通道不受此设置影响 |
 
-旧版本的 `holdThresholdMs` / `tapMode` / `holdMode` 配置键已废弃，Worker 收到时会忽略并记录日志（不会拒绝，避免阻断插件启动）。
+切换到或离开 `gatt` 会重新连接语音链路并结束当前录音。其他来源切换会加入或离开共享 HCI 抓包；若恰好成为第一个或最后一个订阅者，仍可能因系统蓝牙重载而打断连接，建议在空闲时更改。
 
-## 测试
+旧版本的 `holdThresholdMs` / `tapMode` / `holdMode` 配置已废弃，Worker 会忽略并记录日志，不会因此阻止启动；未知配置项或非法值仍会被拒绝。
 
-```bash
+## 常见问题与限制
+
+### 已连接，但确认 / 返回键没有反应
+
+「遥控器已连接」表示语音链路连接状态，**请同时检查设置页的按键状态**。
+
+- 确认 HCI 特权组件和 PacketLogger 已安装。`auto` 只有在组件缺失、协议不兼容等确定性失败时才回退 IOKit。
+- 确认特权组件支持 HCI 协议 v4；插件会与其他 v4 客户端共享抓包。协议版本不兼容属于确定性失败，`auto` 会回退 IOKit 助手，显式 `hci` 模式会显示错误。
+- 开启「拦截原生按键」后若状态显示拦截失败，HCI 按键仍然可用，但确认键等原生动作也可能同时送到播放器。
+- macOS 26.5 上 IOKit / GATT 按键路径在本项目实测中不可用；保留它们用于兼容性尝试与诊断，其他系统版本仍需验证。详见 [macOS HID 限制与实测记录](spec/hid-macos-limitations.md)。
+- IOKit 的「独占冲突」不等于「缺少输入监控权限」；即使成功打开设备也不代表收到按键报文，应以实际状态和日志判断。
+
+### 闲置后没有反应
+
+遥控器闲置数分钟后可能深度休眠。长按任意键约 3 秒唤醒，唤醒期间第一个按键会被遥控器自身消耗。若仍无反应，可取下电池约 5 秒后装回，再等待重连。
+
+### 扫不到遥控器，或一直连接失败
+
+- 检查系统蓝牙、Vokie 的蓝牙权限及遥控器是否唤醒。
+- BLE 自动连接只接受名称为 `Chromecast Remote` / `Chromecast Voice Remote` 的候选；HCI 接受这两个名称或已识别遥控器的真实蓝牙地址；A0 还必须通过 HID UUID + 序列号回读绑定。无名称、改名或其他型号的设备可能被忽略。
+- 可恢复的 BLE 故障按 1–8 秒退避重试；明确的权限拒绝、后端不可用或协议错误会停止重试，需要先解决原因。状态页会显示连接阶段和错误原因。
+- 有 HID 身份时按其外设 UUID 选择语音连接；无身份时保留旧版名称筛选。多只遥控器同时在线时优先选择 A0，同一 profile 内保持当前设备，暂不提供手动选择。A0 若一直显示「等待设备身份验证」，请检查蓝牙权限与配对状态；插件不会因全零地址而放宽验证。
+
+### 短按模式下，按住期间的声音会丢失吗？
+
+短按模式在第一次松开语音键时创建会话，并打开持续收音。按住期间的音频会先缓冲、随后补发，但只保留最近约 **2 秒**；不要将短按模式当作长时间按住录音使用。持续收音开麦失败会有限重试，耗尽后取消会话，避免产生空输出。
+
+### Intel Mac 可以用吗？
+
+仓库内置的 IOKit 助手是 **arm64** 二进制。Intel Mac 如需使用 IOKit 通道，需在本机重新构建助手；这不代表其他依赖或整套链路已经过 Intel 真机验证。
+
+## 工作原理
+
+```text
+Chromecast Voice Remote
+├─ 语音键与麦克风 → BLE / ATVV → Vokie Host BLE 适配器 → 插件 Worker
+└─ 确认 / 返回键 → HCI 抓包（默认）/ IOKit / GATT → 插件 Worker
+                                                          ↓
+                                         Vokie 录音会话与发送 / 撤销命令
+```
+
+- **语音**：支持 ATVV v0.4 / v1.0，优先协商 ADPCM 16 kHz；8 kHz 音频重采样至 16 kHz，通过插件 WebSocket 发送单声道 `pcm_s16le` 音频帧。A0 在解码、重采样后应用独立 DSP 与 -6 dBFS 峰值保护，处理 profile 在每次手势开始时固定；旧款保持原始 PCM。ATVV v1.0 物理流每 10 秒发送 `MIC_EXTEND`（写失败后本连接停止重试），免提主机流每 4 秒保活，v0.4 物理流不发送 `MIC_EXTEND`。
+- **按键**：默认通过 HCI v4 连接特权守护进程 `/var/run/com.vokie.hci.sock`，共享 PacketLogger 抓包，从蓝牙通知中解析确认 / 返回键并做按下去重。开启原生按键拦截时，抓包建立后请求守护进程抢占 HID，离开抓包前释放；抢占失败只降级拦截，不中断 HCI 按键。IOKit 助手与 GATT 是可选按键源，不与 HCI 同时处理按键。
+- **会话**：`hold` 对应 `ptt`，`tap` 对应 `handsfree-ptt`；确认键发出 `send_enter`，返回键发出 `undo_last_output`。
+
+协议、兼容性调查与实现细节见：
+
+- [BLE 设备筛选、连接隔离与重试](spec/ble-device-isolation.md)
+- [A0 新款兼容、身份验证与迁移记录](spec/a0-remote-support.md)
+- [HCI 按键通道、共享抓包与原生按键拦截](spec/hci-button-source.md)
+- [IOKit 助手实现与诊断](spec/hid-helper.md)
+- [macOS 26.5 HID 逐层实测记录](spec/hid-macos-limitations.md)
+
+这些文档包含对应开发阶段的历史记录；当前功能与默认行为以本 README 和代码为准。
+
+## 开发与测试
+
+### 目录
+
+```text
+vokie.plugin.json  # 插件清单、版本与能力声明
+worker/            # Host 通信、BLE / ATVV、按键源、音频与会话状态机
+ui/index.html      # 状态与设置页
+native/            # Swift IOKit 助手源码与构建脚本
+assets/            # 预编译助手、图标与插件 UI SDK
+spec/              # 接入规格、诊断与实现记录
+test/              # 单元测试与 fake Host / 遥控器 / HCI 集成测试
+```
+
+### 运行测试
+
+在源码仓库根目录执行：
+
+```sh
 node --test
+```
+
+覆盖 ATVV / PCM 编解码、A0 DSP 与峰值保护、物理/免提保活、两种语音模式、BLE 候选隔离与重连、三条按键通道、HCI v4 共享抓包、HID 抢占与回退、配置校验及 Worker 生命周期。macOS 上的原生报文规范化测试需要 Swift 工具链（Xcode Command Line Tools）。
+
+测试使用 fake Host、设备与助手；HCI 套接字指向测试服务或不存在路径，不连接真实守护进程，也不打开真实 HID 设备。**自动化通过不替代真机兼容性验收。**
+
+### 重建 IOKit 助手
+
+仅在修改原生源码或需要本机架构的二进制时执行，需要 Swift 工具链：
+
+```sh
 sh native/build-helper.sh
 ```
 
-- `test/ble-isolation.test.mjs`：混合型号扫描、旧请求隔离、连接超时、断开确认后重试、失败候选恢复及 BLE/HID 通道分离。
-- `test/native-helper.test.mjs`：编译纯 Swift 报文规范化测试，验证未知报文不冒充按键；不打开设备。macOS 上需 Swift 工具链。
-- `test/protocol.test.mjs`：ATVV 编解码（手工推演的 IMA-ADPCM 参考值）、PCM 帧、HID 去抖、BLE 传输（握手、UUID 短/长回退、退避重连）、手势状态机（hold/tap 两模式 + 互斥忽略 + 开麦重试 + 会话拒绝 + 设备丢失）、助手进程管理（崩溃有限重启、执行位自修复）。
-- `test/hci-button-source.test.mjs`：nhdr/ACL 解析（设备过滤、方向、PB/CID/opcode 守卫）、按键状态机、fake HCI 守护进程下的握手、争用重试、确定性失败、断线重连与异常 stopCapture 处理。测试通过 `VOKIE_HCI_SOCKET` 指向 fake/不存在路径，绝不触碰真机守护进程。
-- 构建脚本的冒烟验证仅运行 `--help`，不打开实际设备；自动化测试使用 fake helper，不触发系统 HID 授权。真实遥控器的共享/独占读取仍需按 spec 现场验收。
-- `test/plugin.test.mjs`：真实 worker 进程 + fake Host + fake 遥控器 + fake HCI 守护进程 —— 清单一致性、hold→ptt / tap→handsfree-ptt 全流程音频帧字节级校验、模式切换后旧手势失效、HID 命令（HCI 抓包 / GATT / IOKit 助手三条按键通道）、auto 模式 HCI 优先与 IOKit 回退、配置校验（含 legacy 键拒绝）、断连 `session_cancel`、stop/shutdown 幂等。
+脚本会覆盖 [assets/chromecast-hid-helper](assets/chromecast-hid-helper)，并仅以 `--help` 做冒烟检查，不打开实际设备。新增 `--identity` 模式只枚举 HID 身份；只有收到插件的抓包已开启通知后，才对 A0 指定 UUID 读取序列号，不订阅或写入 ATVV。
 
-## 已知限制
+### 排查日志
 
-- **仅 macOS**：Host BLE 适配器只有 CoreBluetooth 后端；IOKit 助手与 HCI 守护进程也是 macOS 专属。其他平台进入 `error`。
-- **HCI 抓包依赖特权组件**：需要 Vokie 主应用（设备实验室）安装的 `com.vokie.hcihelper` LaunchDaemon 与 `/Applications/PacketLogger.app`；未安装时 `auto` 回退 IOKit（macOS 26.5 上同样收不到报文），`hci` 显式模式在状态页显示缺件原因。开始/停止抓包会重载 bluetoothd（一次全局蓝牙闪断）。
-- **抓包系统级独占**：与 Apple TV 麦克风抓包、主应用自己的 Google TV 遥控器服务互斥；冲突时每 5 秒安静重试，恢复后自动接替。主应用设备实验室的 Google TV 遥控器与本插件不应同时开启按键。
-- **macOS 26.5 上 IOKit/GATT 按键通道不可用**（逐层实测见 [spec/hid-macos-limitations.md](spec/hid-macos-limitations.md)）；在旧系统上仍可作为备选。
-- **IOKit 助手要求遥控器与 macOS 配对**（系统蓝牙 HID 栈可见设备）；未配对时可显式尝试 GATT 通道（部分固件可能拒绝未加密的 HID 订阅，此时按键不可用，语音不受影响）。
-- **BLE 自动识别基于名称**：无名称、改名或其他名称的设备会被忽略；名称加 ATVV 协商不等于硬件认证。HID 仍独立按 VID/PID 精确匹配；多只同型号遥控器暂不支持逐只绑定。
-- **助手预编译二进制为 arm64**（本机构建）。Intel Mac 需重跑 `native/build-helper.sh`（交叉编译时需把构建脚本列出的全部 Swift 源文件传给 `swiftc -arch x86_64`）。
-- **权限与占用是不同问题**：`kIOReturnExclusiveAccess` 表示独占访问冲突，不能直接归因为缺少输入监控。共享读取也可能受输入监控限制；助手仅检查权限，不主动调用授权请求接口（IOKit 打开设备本身仍可能触发系统授权流程）。应以实际运行进程的权限归属和报文结果判断，不预设某个 Electron 路径授权后必定恢复。
-- **遥控器深度休眠**：闲置数分钟后休眠，长按任意键约 3 秒唤醒；唤醒期间第一个按键被遥控器自身消耗。若「已连接但按键无反应」，取下电池约 5 秒后装回即可恢复。
-- 短按模式（handsfree-ptt）的会话在抬起瞬间开启，按住期间的音频（最多约 2 s）已缓冲并在接受后补发；更长的按住只保留最后约 2 s。
+优先查看插件设置页的连接、按键与会话信息。Worker stderr 中，`[cast-plugin]` 记录插件 ID、版本与加载路径，`[cast-ble]` / `[cast-atvv]` 记录连接与语音事件，`[cast-hci]` / `[cast-hid]` 记录按键信息，`[cast-session]` 记录会话结束原因与音频帧数。
 
 ## 致谢
 
-ATVV 协议细节（特征 UUID、capabilities 协商、reason 码语义、短按/长按手势判定）与 IOKit 按键读取参考并实测对齐 [VincentKingHsu/vRemoter](https://github.com/VincentKingHsu/vRemoter)（MIT）的逆向实现。
+ATVV 协议与 IOKit 按键读取参考了 [VincentKingHsu/vRemoter](https://github.com/VincentKingHsu/vRemoter) 的逆向实现。感谢其对 Chromecast Voice Remote 协议的探索与公开分享。

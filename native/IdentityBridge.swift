@@ -70,10 +70,10 @@ final class IdentityBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDele
                 "deviceAddress": string("DeviceAddress")]
             if !candidates.contains(value) { candidates.append(value) }
         }
-        // Keep the selected device stable while it remains present; do not jump
-        // between multiple HID collections or two same-name remotes each poll.
-        let next = candidates.first(where: { $0 == identity }) ??
-            candidates.sorted { ($0["deviceId"] ?? "") < ($1["deviceId"] ?? "") }.first ?? [:]
+        // A0 and legacy share VID/PID but use different GATT layouts. Keep a
+        // selected device stable within the same profile and promote A0 when it
+        // appears, matching the built-in remote service.
+        let next = preferredRemoteIdentity(candidates: candidates, current: identity)
         if next != identity {
             disconnect()
             identity = next

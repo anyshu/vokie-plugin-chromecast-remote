@@ -27,6 +27,14 @@ precondition(supportedIdentity(vendor: 0x18d1, product: 0x9450, page: 12, usage:
 precondition(!supportedIdentity(vendor: 0x1234, product: 0x9450, page: 12, usage: 1))
 precondition(!supportedIdentity(vendor: 0x18d1, product: 0x1234, page: 12, usage: 1))
 precondition(!supportedIdentity(vendor: 0x18d1, product: 0x9450, page: 1, usage: 2))
+let legacyA = ["deviceId": "a", "modelNumber": "hid_mouse"]
+let legacyB = ["deviceId": "b", "modelNumber": "hid_mouse"]
+let a0 = ["deviceId": "z", "modelNumber": " A0 "]
+precondition(remoteIdentitySelectionPriority(modelNumber: a0["modelNumber"]) == 1)
+precondition(preferredRemoteIdentity(candidates: [legacyB, a0, legacyA], current: legacyB) == a0)
+precondition(preferredRemoteIdentity(candidates: [legacyA, legacyB], current: legacyB) == legacyB)
+precondition(preferredRemoteIdentity(candidates: [legacyB, legacyA], current: [:]) == legacyA)
+precondition(preferredRemoteIdentity(candidates: [], current: a0).isEmpty)
 print("normalization passed")
 `);
     const executable = join(dir, 'report-test');

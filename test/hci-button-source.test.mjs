@@ -138,14 +138,20 @@ test('hci source: startCapture handshake, button edges, request shape', async ()
     assert.ok(statuses.some((info) => info.phase === 'capturing'));
     assert.equal(source.active, true);
 
-    // The daemon sees a well-formed v2 startCapture request.
+    // The daemon sees a well-formed v4 capture request, followed by the
+    // privileged HID seizure that prevents OK from reaching media players.
     const request = daemon.requests.find((item) => item.command === 'startCapture');
     assert.ok(request);
     assert.equal(request.protocol, 'vokie.appleTvRemote.hci');
-    assert.equal(request.requiredVersion, '2');
+    assert.equal(request.requiredVersion, '4');
     assert.equal(request.caller.pid, process.pid);
     assert.equal(typeof request.caller.uid, 'number');
     assert.equal(request.captureId, `chromecast-plugin-${process.pid}`);
+    const seize = daemon.requests.find((item) => item.command === 'seizeHid');
+    assert.ok(seize);
+    assert.equal(seize.vendorId, 0x18d1);
+    assert.equal(seize.productId, 0x9450);
+    assert.equal(daemon.seized, true);
 
     daemon.sendNhdr(nhdrSelectDown());
     daemon.sendNhdr(nhdrBackDown());
@@ -162,6 +168,7 @@ test('hci source: startCapture handshake, button edges, request shape', async ()
     source.stop();
     assert.equal(source.active, false);
     await waitFor(() => daemon.capturing === false, 'daemon releases capture');
+    await waitFor(() => daemon.seized === false, 'daemon releases HID seizure');
     assert.equal(daemon.sockets.length, 0);
   } finally {
     await daemon.close();
@@ -169,27 +176,107 @@ test('hci source: startCapture handshake, button edges, request shape', async ()
   }
 });
 
-test('hci source: contention is retryable and not definitive', async () => {
+test('hci source: v4 shares one capture across clients while seizure stays single-owner', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'hci-src-'));
-  const daemon = new FakeHciDaemon({ captureAllowed: false });
+  const daemon = new FakeHciDaemon();
+  await daemon.listen(join(dir, 'hci.sock'));
+  const firstEdges = [];
+  const secondEdges = [];
+  try {
+    const first = new HciButtonSource({
+      socketPath: join(dir, 'hci.sock'),
+      onEdge: (edge) => firstEdges.push(edge),
+      clock: fastClock()
+    });
+    const second = new HciButtonSource({
+      socketPath: join(dir, 'hci.sock'),
+      onEdge: (edge) => secondEdges.push(edge),
+      clock: fastClock()
+    });
+    first.start();
+    second.start();
+    await waitFor(() => daemon.captureSubscriptions.size === 2, 'both capture subscribers');
+    assert.equal(daemon.seized, true);
+    daemon.sendNhdr(nhdrSelectDown());
+    await waitFor(() => firstEdges.length === 1 && secondEdges.length === 1, 'both subscribers receive nhdr');
+    first.stop();
+    await waitFor(() => daemon.captureSubscriptions.size === 1, 'second subscriber remains');
+    assert.equal(daemon.capturing, true);
+    second.stop();
+    await waitFor(() => daemon.capturing === false, 'last subscriber stops capture');
+  } finally {
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('hci source: native suppression can be toggled without restarting capture', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-src-'));
+  const daemon = new FakeHciDaemon();
+  await daemon.listen(join(dir, 'hci.sock'));
+  try {
+    const source = new HciButtonSource({
+      socketPath: join(dir, 'hci.sock'),
+      suppressNative: false,
+      clock: fastClock()
+    });
+    source.start();
+    await waitFor(() => source.active, 'capture without seizure');
+    assert.equal(daemon.requests.some((item) => item.command === 'seizeHid'), false);
+    source.setSuppressNative(true);
+    await waitFor(() => daemon.seized, 'HID seized');
+    assert.equal(source.hidSeized, true);
+    source.setSuppressNative(false);
+    await waitFor(() => !daemon.seized, 'HID released');
+    assert.equal(source.active, true);
+    source.stop();
+  } finally {
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('hci source: seizure failure degrades suppression but keeps buttons active', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-src-'));
+  const daemon = new FakeHciDaemon({ seizeAllowed: false });
+  await daemon.listen(join(dir, 'hci.sock'));
+  const edges = [];
+  const statuses = [];
+  try {
+    const source = new HciButtonSource({
+      socketPath: join(dir, 'hci.sock'),
+      onEdge: (edge) => edges.push(edge),
+      onStatus: (info) => statuses.push(info),
+      clock: fastClock()
+    });
+    source.start();
+    await waitFor(() => statuses.some((info) => info.hidSeizeError), 'seize failure');
+    assert.equal(source.active, true);
+    daemon.sendNhdr(nhdrSelectDown());
+    await waitFor(() => edges.length === 1, 'button after seize failure');
+    source.stop();
+  } finally {
+    await daemon.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('hci source: version mismatch is a definitive capture failure', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hci-src-'));
+  const daemon = new FakeHciDaemon({ version: '3' });
   await daemon.listen(join(dir, 'hci.sock'));
   const statuses = [];
   try {
     const source = new HciButtonSource({
       socketPath: join(dir, 'hci.sock'),
-      onEdge: () => {},
       onStatus: (info) => statuses.push(info),
       clock: fastClock()
     });
     source.start();
-    const retrying = await waitFor(() =>
-      statuses.some((info) => info.phase === 'retrying' && info.definitive === false && /another capture/.test(info.error ?? ''))
-    );
-    assert.ok(retrying);
-    // Contention retries until the capture becomes available, then captures.
-    daemon.captureAllowed = true;
-    await waitFor(() => statuses.some((info) => info.phase === 'capturing'));
-    assert.ok(daemon.requests.filter((item) => item.command === 'startCapture').length >= 2);
+    await waitFor(() => statuses.some((info) =>
+      info.phase === 'retrying' && info.definitive === true && /需要 v4.*当前 v3/.test(info.error ?? '')
+    ), 'version mismatch');
+    assert.equal(source.active, false);
     source.stop();
   } finally {
     await daemon.close();
@@ -280,11 +367,16 @@ test('hci source: unexpected captureStopped re-requests the capture', async () =
     });
     source.start();
     await waitFor(() => statuses.some((info) => info.phase === 'capturing'));
+    const startCaptureCount = () => daemon.requests.filter((item) => item.command === 'startCapture').length;
+    const initialStartCount = startCaptureCount();
+    assert.equal(initialStartCount, 1);
     daemon.stopCapture();
+    await waitFor(() => startCaptureCount() === initialStartCount + 1, 'capture re-request');
+    // The fast clock reduces the five-second retry to 10 ms. Once the immediate
+    // re-request succeeds, waiting well past that deadline must not reconnect.
     await delay(100);
-    // The daemon answered the follow-up startCapture with captureStarted.
-    assert.equal(daemon.requests.filter((item) => item.command === 'startCapture').length >= 2, true);
-    assert.ok(statuses.filter((info) => info.phase === 'capturing').length >= 2);
+    assert.equal(startCaptureCount(), initialStartCount + 1);
+    assert.equal(source.active, true);
     source.stop();
   } finally {
     await daemon.close();
